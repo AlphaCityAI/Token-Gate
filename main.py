@@ -25,11 +25,9 @@ from src.nft_traits import get_user_nft_trait_count, get_user_nft_category_count
 
 # ==================== Global Constants ===========================
 CACHE_TTL = 1200      # Cache Time-To-Live in seconds (20 minutes)
+VERIFICATION_CACHE_TTL = 60  # Freshness target for interactive verification checks
 NFT_CACHE_TTL = 43200   # Cache Time-To-Live for NFTs in seconds (12 hours)
-BATCH_SIZE = 10         # Number of wallet addresses per API batch
 API_TIMEOUT = 60        # Timeout for API calls in seconds
-SLEEP_BETWEEN_BATCHES = 0.5 # Sleep delay (seconds) between batches
-SLEEP_RETRY = 1         # Delay (seconds) between retry attempts
 SLEEP_BETWEEN_TASKS = 172800 # Interval (seconds) for periodic tasks (12 hours)
 BOT_POLLING_TIMEOUT = 30  # Bot polling timeout (seconds)
 BOT_LONG_POLLING_TIMEOUT = 10 # Bot long polling timeout (seconds)
@@ -1559,7 +1557,8 @@ def handle_verify_wallet_callback(call):
             try:
                 chat_obj = bot.get_chat(group_id)
                 group_name = chat_obj.title
-            except:
+            except Exception as e:
+                logging.warning(f"Could not resolve group title for {group_id}: {e}")
                 group_name = f"Group {group_id}"
 
             text_lines = [
@@ -1578,13 +1577,14 @@ def handle_verify_wallet_callback(call):
             text_lines.append("Your wallet has been registered. You can now participate in group activities!")
 
             try:
-                invite = bot.export_chat_invite_link(group_id)
-                text_lines += [
-                    "",
-                    "*Group Invite Link:*",
-                    f"[Join {group_name}]({invite})",
-                    "_Use this link to join or return to the group._"
-                ]
+                invite = create_single_use_invite_link(group_id)
+                if invite:
+                    text_lines += [
+                        "",
+                        "*Group Invite Link:*",
+                        f"[Join {group_name}]({invite})",
+                        "_Use this link to join or return to the group._"
+                    ]
             except Exception as e:
                 logging.error(f"Error fetching invite link for group {group_id}: {e}")
 
@@ -1637,6 +1637,18 @@ def handle_poll_callback(call):
         logging.error(f"Error in poll callback handler: {e}")
         bot.answer_callback_query(call.id, "An error occurred.")
 
+
+
+def create_single_use_invite_link(group_id):
+    """Create a short-lived single-use invite link."""
+    try:
+        expire_date = int(time.time()) + 3600
+        invite = bot.create_chat_invite_link(group_id, expire_date=expire_date, member_limit=1)
+        return getattr(invite, 'invite_link', None) or invite.get('invite_link')
+    except Exception as e:
+        logging.warning(f"Failed to create single-use invite link for {group_id}: {e}")
+        return None
+
 def create_registration_link(group_id, send_to_chat_id=None):
     # If send_to_chat_id is provided, send results there, otherwise send to group_id
     target_chat_id = send_to_chat_id if send_to_chat_id is not None else group_id
@@ -1676,7 +1688,8 @@ def show_config_menu_private(chat_id, group_id):
         try:
             chat_obj = bot.get_chat(group_id)
             group_name = chat_obj.title
-        except:
+        except Exception as e:
+            logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
 
         # Store the group context for this user
@@ -1736,7 +1749,8 @@ def show_votesetup_menu_private(chat_id, group_id):
         try:
             chat_obj = bot.get_chat(group_id)
             group_name = chat_obj.title
-        except:
+        except Exception as e:
+            logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
 
         # Store the group context for this user
@@ -1783,7 +1797,8 @@ def show_mywallets_private(chat_id, group_id):
         try:
             chat_obj = bot.get_chat(group_id)
             group_name = chat_obj.title
-        except:
+        except Exception as e:
+            logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
 
         # Get user registration data
