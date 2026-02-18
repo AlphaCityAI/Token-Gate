@@ -25,17 +25,13 @@ from src.nft_traits import get_user_nft_trait_count, get_user_nft_category_count
 
 # ==================== Global Constants ===========================
 CACHE_TTL = 1200      # Cache Time-To-Live in seconds (20 minutes)
+VERIFICATION_CACHE_TTL = 60  # Freshness target for interactive verification checks
 NFT_CACHE_TTL = 43200   # Cache Time-To-Live for NFTs in seconds (12 hours)
-BATCH_SIZE = 10         # Number of wallet addresses per API batch
 API_TIMEOUT = 60        # Timeout for API calls in seconds
-SLEEP_BETWEEN_BATCHES = 0.5 # Sleep delay (seconds) between batches
-SLEEP_RETRY = 1         # Delay (seconds) between retry attempts
 SLEEP_BETWEEN_TASKS = 172800 # Interval (seconds) for periodic tasks (12 hours)
 BOT_POLLING_TIMEOUT = 30  # Bot polling timeout (seconds)
 BOT_LONG_POLLING_TIMEOUT = 10 # Bot long polling timeout (seconds)
 REMINDER_THRESHOLD = 1200   # Reminder threshold in seconds (20 minutes)
-VERIFICATION_AMOUNT = 0.69  # Amount of SUI to transfer for verification
-DONATION_ADDRESS = "0xb1a99b2135e594ed62506352a79362a146dda11398cacb187cb42533b66ce69c" # Donation address
 VERIFICATION_TIMEOUT = 600  # Verification timeout in seconds (10 minute)
 ALERT_COOLDOWN_DAYS = 2 # Days before re-alerting a user with low balance
 MAX_CACHE_SIZE = 1000  # Maximum number of entries in balance/NFT caches
@@ -55,30 +51,28 @@ logging.getLogger().setLevel(logging.INFO)
 
 # ==================== Bot and Flask Configuration =================
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-INSIDEX_API_KEY = os.getenv('INSIDEX_API_KEY')
+SUI_RPC_URL = os.getenv('SUI_RPC_URL', 'https://fullnode.mainnet.sui.io:443')
 
 BOT_NAME = "GuildSafeBot"
 
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
-if not INSIDEX_API_KEY:
-    raise ValueError("INSIDEX_API_KEY not found in environment variables")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
 # ==================== API Session Setup =======================
-insidex_session = requests.Session()
-insidex_session.headers.update({
-    'x-api-key': INSIDEX_API_KEY,
+sui_rpc_session = requests.Session()
+sui_rpc_session.headers.update({
+    'Content-Type': 'application/json',
     'Connection': 'keep-alive',
-    'User-Agent': 'WalletAlertBot/1.0'
+    'User-Agent': 'WalletAlertBot/2.0'
 })
 adapter = requests.adapters.HTTPAdapter(  # type: ignore[attr-defined]
     pool_connections=10,
     pool_maxsize=20
 )
-insidex_session.mount('https://', adapter)
+sui_rpc_session.mount('https://', adapter)
 
 # ==================== Database Setup =============================
 db_lock = threading.Lock()
@@ -607,8 +601,6 @@ SUBSCRIBER_CONFIGS = load_configs_from_db()
 balance_cache = {}
 nft_cache = {}
 last_registration_prompt = {}
-verified_transactions = set() # Store transaction IDs that have been used for verification
-transaction_lock = threading.Lock()
 
 # ==================== Cleanup Functions =============================
 def cleanup_expired_data():
@@ -637,14 +629,13 @@ def cleanup_expired_data():
         logging.error(f"Error cleaning up expired verifications from DB: {e}")
 
 # ==================== fetch_wallet_balances Function =================
-def make_api_request_with_retry(session: requests.Session, url: str, max_retries: int = 3, base_delay: int = 1) -> requests.Response:
-    """Make API request with exponential backoff retry logic."""
+def make_api_request_with_retry(request_callable, max_retries: int = 3, base_delay: int = 1):
+    """Run a request callable with exponential backoff retry logic."""
     last_exception: Exception = Exception("No request attempted")
     for attempt in range(max_retries):
         try:
-            response = session.get(url, timeout=API_TIMEOUT)
-            return response
-        except (requests.exceptions.ConnectionError, 
+            return request_callable()
+        except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
                 requests.exceptions.RequestException) as e:
             last_exception = e
@@ -657,136 +648,56 @@ def make_api_request_with_retry(session: requests.Session, url: str, max_retries
             time.sleep(delay)
     raise last_exception
 
-def fetch_wallet_balances(addresses, monitored_token, decimals, retry_on_zero=True):
-    """
-    Fetch wallet balances from Insidex using batched requests with robust error handling.
-    Returns a dict mapping each lowercase wallet address to its balance (or None if the data is missing).
-    """
+
+def sui_rpc_request(method: str, params, max_retries: int = 3):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000),
+        "method": method,
+        "params": params
+    }
+
+    def do_request():
+        response = sui_rpc_session.post(SUI_RPC_URL, json=payload, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        if 'error' in data:
+            raise requests.exceptions.RequestException(f"Sui RPC error for {method}: {data['error']}")
+        return data.get('result')
+
+    return make_api_request_with_retry(do_request, max_retries=max_retries)
+
+
+def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, cache_ttl=None):
+    """Fetch token balances directly from Sui RPC (on-chain), no third-party indexers."""
     results = {}
     current_time = time.time()
     cache_key = f"{','.join(sorted(addresses))}|{monitored_token}|{decimals}"
 
-    # Check cache first
-    if cache_key in balance_cache:
+    effective_cache_ttl = CACHE_TTL if cache_ttl is None else cache_ttl
+
+    if use_cache and cache_key in balance_cache:
         cache_time, cache_result = balance_cache[cache_key]
-        if current_time - cache_time < CACHE_TTL:
-            logging.info(f"Returning cached data for {len(addresses)} addresses")
+        if current_time - cache_time < effective_cache_ttl:
             return cache_result
 
-    # Batch processing
-    for i in range(0, len(addresses), BATCH_SIZE):
-        batch = addresses[i:i+BATCH_SIZE]
-        batch_param = ','.join(batch)
-        url = f'https://api-ex.insidex.trade/spot-portfolio/multiple?addresses={batch_param}'
-        logging.info(f"Processing batch {(i // BATCH_SIZE) + 1} for {len(batch)} addresses")
-
+    for wallet in addresses:
+        wallet_lower = wallet.lower()
         try:
-            response = make_api_request_with_retry(insidex_session, url)
-
-            if response.status_code != 200:
-                logging.error(f"Batch error for {batch} - Status: {response.status_code}")
-                for wallet in batch:
-                    results[wallet.lower()] = None
-                continue
-
-            data = response.json()
-            if not data:
-                logging.error(f"Empty response for batch {batch}")
-                for wallet in batch:
-                    results[wallet.lower()] = None
-                continue
-
-            returned = { d.get('address', '').lower(): d for d in data if d.get('address') }
-            for wallet in batch:
-                wallet_lower = wallet.lower()
-                if wallet_lower not in returned:
-                    logging.warning(f"No data for wallet {wallet_lower}")
-                    results[wallet_lower] = None
-                else:
-                    wallet_data = returned[wallet_lower]
-                    bal_list = wallet_data.get('balances')
-                    if bal_list is None:
-                        results[wallet_lower] = None
-                    else:
-                        found = False
-                        for balance in bal_list:
-                            if balance.get('coinType') == monitored_token:
-                                try:
-                                    cleaned = str(balance.get('balance', '0')).replace(',', '')
-                                    amount = float(cleaned) / (10 ** decimals)
-                                except Exception as e:
-                                    logging.error(f"Balance parse error for {wallet_lower}: {e}")
-                                    amount = None
-                                results[wallet_lower] = amount
-                                found = True
-                                break
-                        if not found:
-                            # If the balances list was provided but our token wasn't in it, the balance is 0.
-                            results[wallet_lower] = 0
-
+            result = sui_rpc_request("suix_getBalance", [wallet_lower, monitored_token])
+            raw_balance = result.get("totalBalance", "0") if result else "0"
+            amount = float(raw_balance) / (10 ** decimals)
+            results[wallet_lower] = amount
         except Exception as e:
-            logging.error(f"Exception while processing batch {batch}: {e}")
-            for wallet in batch:
-                results[wallet.lower()] = None
+            logging.error(f"Failed to fetch on-chain balance for {wallet_lower}: {e}")
+            results[wallet_lower] = None
 
-        # Optimized sleep between batches
-        time.sleep(SLEEP_BETWEEN_BATCHES)
-
-    # Enhanced retry logic for failed wallets
-    if retry_on_zero:
-        failed_wallets = [w for w in addresses if results.get(w.lower()) is None]
-
-        if failed_wallets:
-            logging.info(f"Retrying {len(failed_wallets)} failed wallets individually")
-
-        for wallet in failed_wallets:
-            wallet_lower = wallet.lower()
-            try:
-                single_url = f'https://api-ex.insidex.trade/spot-portfolio/multiple?addresses={wallet_lower}'
-                logging.info(f"Retrying wallet {wallet_lower}")
-
-                response = make_api_request_with_retry(insidex_session, single_url)
-
-                if response.status_code == 200:
-                    data = response.json()
-                    if data and isinstance(data, list):
-                        wallet_data = data[0]
-                        bal_list = wallet_data.get('balances')
-                        found = False
-                        if bal_list and isinstance(bal_list, list):
-                            for balance in bal_list:
-                                if balance.get('coinType') == monitored_token:
-                                    try:
-                                        cleaned = str(balance.get('balance', '0')).replace(',', '')
-                                        amount = float(cleaned) / (10 ** decimals)
-                                    except Exception as e:
-                                        logging.error(f"Retry parse error for {wallet_lower}: {e}")
-                                        amount = None
-                                    results[wallet_lower] = amount
-                                    found = True
-                                    break
-                            if not found:
-                                # If the balances list was provided but our token wasn't in it, the balance is 0.
-                                results[wallet_lower] = 0
-                else:
-                    logging.error(f"Retry returned status {response.status_code} for wallet {wallet_lower}")
-
-            except Exception as e:
-                logging.error(f"Exception during retry for wallet {wallet_lower}: {e}")
-
-            # Longer sleep between individual retries
-            time.sleep(SLEEP_RETRY * 3)
-
-    # Enforce cache size limit to prevent unbounded memory growth
     if len(balance_cache) >= MAX_CACHE_SIZE:
-        # Remove oldest entries (25% of cache)
         sorted_keys = sorted(balance_cache.keys(), key=lambda k: balance_cache[k][0])
         for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
             del balance_cache[old_key]
-        logging.info(f"Cache size limit reached, removed {MAX_CACHE_SIZE // 4} oldest entries")
-    
+
     balance_cache[cache_key] = (current_time, results)
-    logging.info(f"Completed fetch for {len(addresses)} wallets")
     return results
 
 # ==================== Periodic Tasks ==============================
@@ -1523,11 +1434,9 @@ def process_add_wallet_private(message, group_id, replace_existing):
             """, (user_id, group_id, wallet_address))
 
         verification_message = (
-            "**🔐 Ownership Verification Required:**\n\n"
-            f"To add the wallet `{wallet_address}`, you must first verify you control it.\n\n"
-            f"Please send at least **{VERIFICATION_AMOUNT} SUI** to the following address:\n\n"
-            f"`{DONATION_ADDRESS}`\n\n"
-            "After sending the SUI, click the button below to complete the registration.\n\n"
+            "**🔐 On-Chain Verification Required:**\n\n"
+            f"To add the wallet `{wallet_address}`, click below to complete on-chain balance/NFT validation.\n\n"
+            "No transfer is required.\n\n"
             f"⏰ _This verification request will expire in {VERIFICATION_TIMEOUT // 60} minutes._"
         )
 
@@ -1596,43 +1505,14 @@ def handle_verify_wallet_callback(call):
             )
             return
 
-        bot.answer_callback_query(call.id, "Verifying your transfer...")
+        bot.answer_callback_query(call.id, "Re-checking on-chain holdings...")
         bot.edit_message_text(
-            "⏳ Verifying your SUI transfer...",
+            "⏳ Re-validating your on-chain token/NFT holdings...",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id
         )
 
         try:
-            transfer_result = None
-            with transaction_lock:
-                found_transfer = verify_transfer_between_addresses(
-                    wallet_address,
-                    DONATION_ADDRESS,
-                    VERIFICATION_AMOUNT,
-                    verified_transactions
-                )
-                if found_transfer:
-                    verified_transactions.add(found_transfer['transaction_id'])
-                    transfer_result = found_transfer
-
-            if not transfer_result:
-                bot.edit_message_text(
-                    "❌ No valid SUI transfer found.\n\n"
-                    f"Please ensure you sent at least {VERIFICATION_AMOUNT:.4f} SUI to:\n"
-                    f"`{DONATION_ADDRESS}`\n\n"
-                    "The transfer may take a few moments to appear. Please wait and try again.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    parse_mode="Markdown",
-                    reply_markup=types.InlineKeyboardMarkup().add(
-                        types.InlineKeyboardButton("🔄 Try Again", callback_data=f"verify_wallet_{user_id}")
-                    )
-                )
-                return
-
-            logging.info(f"Verified transfer of {transfer_result['amount']} SUI from {wallet_address} to {DONATION_ADDRESS}, transaction ID: {transfer_result['transaction_id']}")
-            
             with config_lock:
                 cfg = SUBSCRIBER_CONFIGS.get(group_id)
             if not cfg:
@@ -1643,81 +1523,22 @@ def handle_verify_wallet_callback(call):
                 )
                 return
 
-            nft_trait_name = cfg.get("nft_trait_name", "")
-            nft_trait_value = cfg.get("nft_trait_value", "")
-            nft_trait_threshold = cfg.get("nft_trait_threshold", 1)
-            nft_collection_id = cfg.get("nft_collection_id", "")
-            nft_threshold = cfg.get("nft_threshold", 1)
-            
-            verification_details = []
-            collection_nft_count = None
-            trait_count = None
-            trait_api_failed = False
-            
-            if nft_collection_id:
-                try:
-                    collection_nft_count = get_user_nft_count([wallet_address.lower()], nft_collection_id)
-                    if collection_nft_count is None:
-                        logging.warning(f"NFT count API returned None for user {user_id}, allowing registration (safety)")
-                        verification_details.append(f"*NFTs in Collection:* ⚠️ Unavailable (allowed through)")
-                    elif collection_nft_count < nft_threshold:
-                        bot.edit_message_text(
-                            f"❌ *NFT Requirement Not Met*\n\n"
-                            f"This group requires at least {nft_threshold} NFT(s) from the configured collection.\n\n"
-                            f"Your wallet has {collection_nft_count} NFT(s).\n\n"
-                            "Please acquire the required NFTs and try registering again.",
-                            chat_id=call.message.chat.id,
-                            message_id=call.message.message_id,
-                            parse_mode="Markdown"
-                        )
-                        return
-                    else:
-                        verification_details.append(f"*NFTs in Collection:* {collection_nft_count} ✓ (threshold: {nft_threshold})")
-                except Exception as e:
-                    logging.warning(f"Failed to get NFT count for user {user_id}, allowing registration: {e}")
-                    verification_details.append(f"*NFTs in Collection:* ⚠️ Check failed (allowed through)")
-            
-            if nft_trait_name and nft_collection_id:
-                try:
-                    if nft_trait_value:
-                        trait_count = get_user_nft_trait_count(
-                            [wallet_address.lower()],
-                            nft_collection_id,
-                            nft_trait_name,
-                            nft_trait_value
-                        )
-                        trait_desc = f"{nft_trait_name} = {nft_trait_value}"
-                    else:
-                        trait_count = get_user_nft_category_count(
-                            [wallet_address.lower()],
-                            nft_collection_id,
-                            nft_trait_name
-                        )
-                        trait_desc = f"{nft_trait_name} (any value)"
-                    
-                    if trait_count is None:
-                        logging.warning(f"Trait API returned None for user {user_id}, allowing registration (safety)")
-                        trait_api_failed = True
-                        verification_details.append(f"*Trait Verification:* ⚠️ Unavailable (allowed through)")
-                    elif trait_count < nft_trait_threshold:
-                        bot.edit_message_text(
-                            f"❌ *NFT Trait Requirement Not Met*\n\n"
-                            f"This group requires at least {nft_trait_threshold} NFT(s) with trait:\n"
-                            f"`{trait_desc}`\n\n"
-                            f"Your wallet has {trait_count} matching NFT(s).\n\n"
-                            "Please acquire the required NFTs and try registering again.",
-                            chat_id=call.message.chat.id,
-                            message_id=call.message.message_id,
-                            parse_mode="Markdown"
-                        )
-                        return
-                    else:
-                        logging.info(f"User {user_id} passed trait check: {trait_count} >= {nft_trait_threshold} for {nft_trait_name}")
-                        verification_details.append(f"*Trait Verified:* {trait_count} NFT(s) with `{trait_desc}` (threshold: {nft_trait_threshold})")
-                except Exception as trait_e:
-                    logging.warning(f"Trait check failed for user {user_id}, allowing registration: {trait_e}")
-                    trait_api_failed = True
-                    verification_details.append(f"*Trait Verification:* ⚠️ Check failed (allowed through)")
+            requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+            if not requirement_eval["requirements_met"]:
+                error_text = "❌ *Wallet Requirements Not Met*\n\n" + "\n".join(
+                    requirement_eval["errors"] or ["Please retry after updating your holdings."]
+                )
+                if requirement_eval["details"]:
+                    error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
+                bot.edit_message_text(
+                    error_text,
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            verification_details = requirement_eval["details"]
 
             success = save_wallet_for_user(
                 group_id,
@@ -1738,7 +1559,8 @@ def handle_verify_wallet_callback(call):
             try:
                 chat_obj = bot.get_chat(group_id)
                 group_name = chat_obj.title
-            except:
+            except Exception as e:
+                logging.warning(f"Could not resolve group title for {group_id}: {e}")
                 group_name = f"Group {group_id}"
 
             text_lines = [
@@ -1746,7 +1568,6 @@ def handle_verify_wallet_callback(call):
                 "",
                 f"*Group:* {group_name}",
                 f"*Wallet:* `{wallet_address}`",
-                f"*Transfer Amount:* {transfer_result['amount']:.4f} SUI",
             ]
             
             if verification_details:
@@ -1758,13 +1579,14 @@ def handle_verify_wallet_callback(call):
             text_lines.append("Your wallet has been registered. You can now participate in group activities!")
 
             try:
-                invite = bot.export_chat_invite_link(group_id)
-                text_lines += [
-                    "",
-                    "*Group Invite Link:*",
-                    f"[Join {group_name}]({invite})",
-                    "_Use this link to join or return to the group._"
-                ]
+                invite = create_single_use_invite_link(group_id)
+                if invite:
+                    text_lines += [
+                        "",
+                        "*Group Invite Link:*",
+                        f"[Join {group_name}]({invite})",
+                        "_Use this link to join or return to the group._"
+                    ]
             except Exception as e:
                 logging.error(f"Error fetching invite link for group {group_id}: {e}")
 
@@ -1817,6 +1639,18 @@ def handle_poll_callback(call):
         logging.error(f"Error in poll callback handler: {e}")
         bot.answer_callback_query(call.id, "An error occurred.")
 
+
+
+def create_single_use_invite_link(group_id):
+    """Create a short-lived single-use invite link."""
+    try:
+        expire_date = int(time.time()) + 3600
+        invite = bot.create_chat_invite_link(group_id, expire_date=expire_date, member_limit=1)
+        return getattr(invite, 'invite_link', None) or invite.get('invite_link')
+    except Exception as e:
+        logging.warning(f"Failed to create single-use invite link for {group_id}: {e}")
+        return None
+
 def create_registration_link(group_id, send_to_chat_id=None):
     # If send_to_chat_id is provided, send results there, otherwise send to group_id
     target_chat_id = send_to_chat_id if send_to_chat_id is not None else group_id
@@ -1856,7 +1690,8 @@ def show_config_menu_private(chat_id, group_id):
         try:
             chat_obj = bot.get_chat(group_id)
             group_name = chat_obj.title
-        except:
+        except Exception as e:
+            logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
 
         # Store the group context for this user
@@ -1916,7 +1751,8 @@ def show_votesetup_menu_private(chat_id, group_id):
         try:
             chat_obj = bot.get_chat(group_id)
             group_name = chat_obj.title
-        except:
+        except Exception as e:
+            logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
 
         # Store the group context for this user
@@ -1963,7 +1799,8 @@ def show_mywallets_private(chat_id, group_id):
         try:
             chat_obj = bot.get_chat(group_id)
             group_name = chat_obj.title
-        except:
+        except Exception as e:
+            logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
 
         # Get user registration data
@@ -2624,103 +2461,168 @@ def calculate_user_vote_weight(group_id, user_id):
         logging.error(f"Error calculating vote weight for user {user_id}: {e}")
         return 0
 
-def get_user_nft_count(addresses, collection_id):
-    """
-    Fetches the total count of NFTs from a specific collection owned by a list of addresses.
-    """
+def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None):
+    """Count NFTs for addresses via on-chain Sui owned-object queries."""
     current_time = time.time()
-    # Using a tuple for the cache key makes it hashable and consistent
-    cache_key = (tuple(sorted(addresses)), collection_id)
+    normalized_addresses = [addr.lower() for addr in addresses if addr]
+    collection_hint = (collection_id or "").strip().lower()
+    cache_key = (tuple(sorted(normalized_addresses)), collection_hint)
 
-    # Check cache first
-    if cache_key in nft_cache:
+    effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
+
+    if use_cache and cache_key in nft_cache:
         cache_time, cache_result = nft_cache[cache_key]
-        if current_time - cache_time < NFT_CACHE_TTL:
-            logging.info(f"Returning cached NFT data for {len(addresses)} addresses.")
+        if current_time - cache_time < effective_cache_ttl:
             return cache_result
 
+    def matches_collection(object_id: str, object_type: str) -> bool:
+        if not collection_hint:
+            return True
+        if collection_hint == object_id:
+            return True
+        if object_type.startswith(f"{collection_hint}::"):
+            return True
+        return collection_hint in object_type
+
+    total_count = 0
+
     try:
-        # Ensure API credentials are set in your environment
-        tradeport_api_user = os.getenv('TRADEPORT_API_USER')
-        tradeport_api_key = os.getenv('TRADEPORT_API_KEY')
+        for owner in normalized_addresses:
+            cursor = None
+            while True:
+                result = sui_rpc_request(
+                    "suix_getOwnedObjects",
+                    [
+                        owner,
+                        {
+                            "options": {
+                                "showType": True
+                            }
+                        },
+                        cursor,
+                        100
+                    ],
+                    max_retries=2
+                )
 
-        if not tradeport_api_user or not tradeport_api_key:
-            logging.error("TRADEPORT_API_USER or TRADEPORT_API_KEY environment variables not set.")
-            return 0
+                data = result.get("data", []) if result else []
+                for item in data:
+                    obj = item.get("data", {})
+                    object_type = (obj.get("type") or "").lower()
+                    object_id = (obj.get("objectId") or "").lower()
 
-        # CORRECTED: The query now accepts a single $where variable.
-        query = """
-            query fetchNftsByOwnerAndCollection($where: nfts_bool_exp!) {
-              sui {
-                nfts(where: $where) {
-                  id
-                }
-              }
-            }
-        """
+                    if not object_type or "::" not in object_type:
+                        continue
+                    if "coin::" in object_type:
+                        continue
 
-        # CORRECTED: The variables are now nested inside a 'where' object to match the query.
-        variables = {
-            "where": {
-                "owner": {"_in": addresses},
-                "collection_id": {"_eq": collection_id}
-            }
-        }
+                    if matches_collection(object_id, object_type):
+                        total_count += 1
 
-        headers = {
-            'x-api-user': tradeport_api_user,
-            'x-api-key': tradeport_api_key,
-            'Content-Type': 'application/json',
-            'User-Agent': 'GuildSafeBot/1.0'
-        }
+                if not result or not result.get("hasNextPage"):
+                    break
+                cursor = result.get("nextCursor")
 
-        # The API endpoint seems to be correct based on general knowledge
-        api_url = 'https://api.indexer.xyz/graphql'
-
-        logging.info(f"Querying NFT API at {api_url} for {len(addresses)} wallets.")
-
-        response = requests.post(
-            api_url,
-            json={'query': query, 'variables': variables},
-            headers=headers,
-            timeout=30
-        )
-
-        total_count = 0
-        if response.status_code == 200:
-            data = response.json()
-            # Navigate through the SUI-specific response structure
-            nfts = data.get('data', {}).get('sui', {}).get('nfts', [])
-            total_count = len(nfts)
-            logging.info(f"Found {total_count} NFTs for collection '{collection_id}' across {len(addresses)} addresses.")
-        else:
-            logging.error(f"NFT API returned status {response.status_code}: {response.text}")
-
-        # Enforce cache size limit to prevent unbounded memory growth
         if len(nft_cache) >= MAX_CACHE_SIZE:
             sorted_keys = sorted(nft_cache.keys(), key=lambda k: nft_cache[k][0])
             for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
                 del nft_cache[old_key]
-            logging.info(f"NFT cache size limit reached, removed {MAX_CACHE_SIZE // 4} oldest entries")
-        
-        # Store result in cache
+
         nft_cache[cache_key] = (current_time, total_count)
         return total_count
 
     except Exception as e:
-        logging.error(f"Error getting NFT count: {e}")
+        logging.error(f"Error getting on-chain NFT count: {e}")
         return 0
 
+
 def check_nft_ownership(addresses, collection_id, threshold):
-    """
-    Check NFT ownership via Tradeport's API endpoint.
-    :param addresses: List of wallet addresses.
-    :param collection_id: NFT collection ID.
-    :param threshold: Number of NFTs required.
-    :return: True if any of the addresses meet the NFT ownership criteria, False otherwise.
-    """
     total_nft_count = get_user_nft_count(addresses, collection_id)
     return total_nft_count >= threshold
+
+
+def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=False):
+    """Evaluate configured token/NFT requirements for a wallet and return structured status."""
+    wallet_lower = wallet_address.lower()
+    registration_mode = cfg.get("registration_mode", "token")
+    token = cfg.get("token", "")
+    decimals = cfg.get("decimals", 6)
+    minimum_holding = cfg.get("minimum_holding", 0)
+    nft_collection_id = cfg.get("nft_collection_id", "")
+    nft_threshold = cfg.get("nft_threshold", 1)
+    nft_trait_name = cfg.get("nft_trait_name", "")
+    nft_trait_value = cfg.get("nft_trait_value", "")
+    nft_trait_threshold = cfg.get("nft_trait_threshold", 1)
+
+    details = []
+    errors = []
+
+    token_valid = False
+    nft_valid = False
+    trait_valid = True
+
+    token_balance = None
+    verification_ttl = VERIFICATION_CACHE_TTL if force_fresh else None
+    if registration_mode in ["token", "both"] and token:
+        balances = fetch_wallet_balances([wallet_lower], token, decimals, use_cache=True, cache_ttl=verification_ttl)
+        token_balance = balances.get(wallet_lower)
+        if token_balance is None:
+            errors.append("⚠️ Unable to verify token balance right now. Please retry in a moment.")
+        else:
+            token_valid = token_balance >= minimum_holding
+            details.append(f"*Token Balance:* {token_balance:,.2f} {'✓' if token_valid else '✗'} (threshold: {minimum_holding:,.2f})")
+
+    nft_count = None
+    trait_count = None
+    trait_api_failed = False
+
+    if registration_mode in ["nft", "both"] and nft_collection_id:
+        nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=True, cache_ttl=verification_ttl)
+        nft_valid = nft_count >= nft_threshold
+        details.append(f"*NFTs in Collection:* {nft_count} {'✓' if nft_valid else '✗'} (threshold: {nft_threshold})")
+
+        if nft_trait_name and nft_valid:
+            try:
+                if nft_trait_value:
+                    trait_count = get_user_nft_trait_count([wallet_lower], nft_collection_id, nft_trait_name, nft_trait_value)
+                    trait_desc = f"{nft_trait_name} = {nft_trait_value}"
+                else:
+                    trait_count = get_user_nft_category_count([wallet_lower], nft_collection_id, nft_trait_name)
+                    trait_desc = f"{nft_trait_name} (any value)"
+
+                if trait_count is None:
+                    trait_api_failed = True
+                    details.append(f"*Trait Verification:* ⚠️ Unavailable for `{trait_desc}` (allowed through)")
+                else:
+                    trait_valid = trait_count >= nft_trait_threshold
+                    details.append(f"*Trait Verification:* {trait_count} {'✓' if trait_valid else '✗'} for `{trait_desc}` (threshold: {nft_trait_threshold})")
+            except Exception as trait_e:
+                trait_api_failed = True
+                details.append("*Trait Verification:* ⚠️ Check failed (allowed through)")
+                logging.warning(f"Trait check failed for user {user_id}, allowing through: {trait_e}")
+
+    if registration_mode == "token":
+        requirements_met = token_valid
+    elif registration_mode == "nft":
+        requirements_met = nft_valid and trait_valid
+    elif registration_mode == "both":
+        requirements_met = token_valid or (nft_valid and trait_valid)
+    else:
+        requirements_met = False
+
+    if not requirements_met and not errors:
+        if registration_mode in ["token", "both"] and token and token_balance is not None and token_balance < minimum_holding:
+            errors.append(f"💰 Token balance below threshold ({token_balance:,.2f} / {minimum_holding:,.2f}).")
+        if registration_mode in ["nft", "both"] and nft_collection_id and nft_count is not None and nft_count < nft_threshold:
+            errors.append(f"🖼️ NFT count below threshold ({nft_count} / {nft_threshold}).")
+        if registration_mode in ["nft", "both"] and nft_trait_name and not trait_api_failed and trait_count is not None and trait_count < nft_trait_threshold:
+            errors.append(f"🎨 NFT trait count below threshold ({trait_count} / {nft_trait_threshold}).")
+
+    return {
+        "requirements_met": requirements_met,
+        "details": details,
+        "errors": errors,
+    }
 
 @db_retry
 def update_poll_display(message, poll_id, title, options):
@@ -3301,107 +3203,54 @@ def confirm_verification(message):
         verification_data = cur.fetchone()
 
     if not verification_data:
-        bot.reply_to(
-            message,
-            "❌ No pending wallet verification found.\n\n"
-            "Please use /register to start the verification process."
-        )
+        bot.reply_to(message, "❌ No pending wallet verification found.\n\nPlease use /register to start the verification process.")
         return
 
     group_id, wallet_address, timestamp = verification_data
 
-    # Validate wallet address
     if not wallet_address or not isinstance(wallet_address, str):
-        bot.reply_to(
-            message,
-            "❌ Invalid wallet address in verification data.\n\n"
-            "Please use /register to start the verification process again."
-        )
-        # Clean up invalid verification data
+        bot.reply_to(message, "❌ Invalid wallet address in verification data.\n\nPlease use /register to start the verification process again.")
         with get_db_cursor() as (conn, cur):
             cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
         return
 
-    # Check if verification has timed out
     if time.time() - timestamp.timestamp() > VERIFICATION_TIMEOUT:
         with get_db_cursor() as (conn, cur):
             cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
-        bot.reply_to(
-            message,
-            "❌ Verification timed out.\n\n"
-            "Please use /register to start the verification process again."
-        )
+        bot.reply_to(message, "❌ Verification timed out.\n\nPlease use /register to start the verification process again.")
         return
 
-    # Show processing message for user feedback
-    processing_msg = bot.reply_to(
-        message,
-        "⏳ Verifying your SUI transfer..."
-    )
+    processing_msg = bot.reply_to(message, "⏳ Re-validating your on-chain token/NFT holdings...")
 
     try:
-        transfer_result = None  # Initialize to ensure it's defined
+        with config_lock:
+            cfg = SUBSCRIBER_CONFIGS.get(group_id)
+        if not cfg:
+            bot.edit_message_text("❌ This group isn't set up yet. Ask an admin to run /gsconfig first.", chat_id=message.chat.id, message_id=processing_msg.message_id)
+            return
 
-        # 1️⃣ Atomically check for transfer and mark it as used
-        with transaction_lock:
-            found_transfer = verify_transfer_between_addresses(
-                wallet_address,
-                DONATION_ADDRESS,
-                VERIFICATION_AMOUNT,
-                verified_transactions
-            )
-            # If a new, valid transfer is found, add its ID to the set
-            # and assign it to our variable for use outside the lock.
-            if found_transfer:
-                verified_transactions.add(found_transfer['transaction_id'])
-                transfer_result = found_transfer
-
-        # 2️⃣ Check if a valid transfer was found
-        if not transfer_result:
+        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+        if not requirement_eval["requirements_met"]:
+            error_text = "❌ *Wallet Requirements Not Met*\n\n" + "\n".join(requirement_eval["errors"] or ["Please retry after updating your holdings."])
+            if requirement_eval["details"]:
+                error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
             bot.edit_message_text(
-                "❌ No valid SUI transfer found.\n\n"
-                f"Please ensure you sent at least {VERIFICATION_AMOUNT:.4f} SUI to:\n"
-                f"`{DONATION_ADDRESS}`\n\n"
-                "The transfer may take a few moments to appear. Please wait and try again.",
+                error_text,
                 chat_id=message.chat.id,
                 message_id=processing_msg.message_id,
                 parse_mode="Markdown"
             )
             return
 
-        # 3️⃣ Valid transfer found - log it and save the wallet
-        logging.info(f"Verified transfer of {transfer_result['amount']} SUI from {wallet_address} to {DONATION_ADDRESS}, transaction ID: {transfer_result['transaction_id']}")
-        with config_lock:
-            cfg = SUBSCRIBER_CONFIGS.get(group_id)
-        if not cfg:
-            bot.edit_message_text(
-                "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.",
-                chat_id=message.chat.id,
-                message_id=processing_msg.message_id
-            )
-            return
-
-        success = save_wallet_for_user(
-            group_id,
-            user_id,
-            message.from_user.username or message.from_user.first_name,
-            [wallet_address.lower()],
-            replace_existing=False
-        )
-
+        wallet_lower = wallet_address.lower()
+        success = save_wallet_for_user(group_id, user_id, message.from_user.username or message.from_user.first_name, [wallet_lower], replace_existing=False)
         if not success:
-            bot.edit_message_text(
-                "❌ Failed to save your wallet. Please try again later.",
-                chat_id=message.chat.id,
-                message_id=processing_msg.message_id
-            )
+            bot.edit_message_text("❌ Failed to save your wallet. Please try again later.", chat_id=message.chat.id, message_id=processing_msg.message_id)
             return
 
-        # 4️⃣ Build success message
         try:
-            chat_obj = bot.get_chat(group_id)
-            group_name = chat_obj.title
-        except:
+            group_name = bot.get_chat(group_id).title
+        except Exception:
             group_name = f"Group {group_id}"
 
         text_lines = [
@@ -3409,59 +3258,31 @@ def confirm_verification(message):
             "",
             f"*Group:* {group_name}",
             f"*Wallet:* `{wallet_address}`",
-            f"*Transfer Amount:* {transfer_result['amount']:.4f} SUI",
-            "",
-            "Thank you for verifying wallet control! You are now registered."
         ]
 
-        # 5️⃣ If private, include an invite link and additional wallet option
+        if requirement_eval["details"]:
+            text_lines += ["", "📋 *Verification Details:*"] + requirement_eval["details"]
+
+        text_lines += ["", "Thank you for completing on-chain verification! You are now registered."]
+
         if message.chat.type == 'private':
             try:
-                invite = bot.export_chat_invite_link(group_id)
-                text_lines += [
-                    "",
-                    "*Group Invite Link:*",
-                    f"[Join {group_name}]({invite})",
-                    "_Use this link to join or return to the group._"
-                ]
+                invite = create_single_use_invite_link(group_id)
+                if invite:
+                    text_lines += ["", "*Group Invite Link:*", f"[Join {group_name}]({invite})", "_Use this link to join or return to the group._"]
             except Exception as e:
                 logging.error(f"Error fetching invite link: {e}")
+            text_lines += ["", "💡 *Want to add another wallet?*", "Use `/register 0x123...abc` to add additional wallets to your account."]
 
-            # Add option to register additional wallet
-            text_lines += [
-                "",
-                "💡 *Want to add another wallet?*",
-                "Use `/register 0x123...abc` to add additional wallets to your account."
-            ]
+        bot.edit_message_text("\n".join(text_lines), chat_id=message.chat.id, message_id=processing_msg.message_id, parse_mode="Markdown", disable_web_page_preview=True)
 
-        final_message = "\n".join(text_lines)
-
-        bot.edit_message_text(
-            final_message,
-            chat_id=message.chat.id,
-            message_id=processing_msg.message_id,
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-
-        # 6️⃣ Clean up verification data
         with get_db_cursor() as (conn, cur):
-            cur.execute("""
-                UPDATE pending_verifications 
-                SET wallet_address = NULL, created_at = NOW()
-                WHERE user_id = %s
-            """, (user_id,))
-
-        logging.info(f"Wallet verification successful for user {user_id}, wallet {wallet_address}")
+            cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (user_id,))
 
     except Exception as e:
         logging.error(f"Error during confirmation: {e}")
         try:
-            bot.edit_message_text(
-                "❌ Error confirming verification. Please try again later.",
-                chat_id=message.chat.id,
-                message_id=processing_msg.message_id
-            )
+            bot.edit_message_text("❌ Error confirming verification. Please try again later.", chat_id=message.chat.id, message_id=processing_msg.message_id)
         except Exception:
             pass
 
@@ -3472,7 +3293,6 @@ def register_wallets(message):
     user_id = message.from_user.id
     group_id = None
 
-    # 1️⃣ Figure out which group they're registering for
     if is_private:
         with get_db_cursor() as (conn, cur):
             cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (user_id,))
@@ -3485,35 +3305,31 @@ def register_wallets(message):
             )
         group_id = result[0]
     else:
-        # Redirect to private chat for security
         group_id = message.chat.id
         markup = types.InlineKeyboardMarkup()
         deep_link = f"https://t.me/{bot.get_me().username}?start=register_{group_id}"
         register_btn = types.InlineKeyboardButton("📱 Register in Private Chat", url=deep_link)
         markup.add(register_btn)
 
-        # Get the message thread ID if this is a topic
         message_thread_id = getattr(message, 'message_thread_id', None)
-
-        # Send with topic context preserved
+        register_text = "🔐 **Wallet Registration**\n\nFor security, wallet registration must be completed in private chat:"
         if message_thread_id:
             bot.send_message(
-                message.chat.id, 
-                "🔐 **Wallet Registration**\n\nFor security, wallet registration must be completed in private chat:",
+                message.chat.id,
+                register_text,
                 reply_markup=markup,
                 parse_mode="Markdown",
                 message_thread_id=message_thread_id
             )
         else:
             bot.send_message(
-                message.chat.id, 
-                "🔐 **Wallet Registration**\n\nFor security, wallet registration must be completed in private chat:",
+                message.chat.id,
+                register_text,
                 reply_markup=markup,
                 parse_mode="Markdown"
             )
         return
 
-    # 2️⃣ Parse the provided wallet (single wallet only)
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         return bot.reply_to(
@@ -3532,14 +3348,9 @@ def register_wallets(message):
             parse_mode="Markdown"
         )
 
-    # Check if wallet is already registered
     if wallet_already_registered(wallet_address, group_id):
-        return bot.reply_to(
-            message,
-            "⚠️ This wallet address is already registered for this group."
-        )
+        return bot.reply_to(message, "⚠️ This wallet address is already registered for this group.")
 
-    # 3️⃣ Load this group's config
     with config_lock:
         cfg = SUBSCRIBER_CONFIGS.get(group_id)
     if not cfg:
@@ -3549,100 +3360,20 @@ def register_wallets(message):
             parse_mode="Markdown"
         )
 
-    token = cfg.get("token", "")
-    decimals = cfg.get("decimals", 6)
-    minimum = cfg.get("minimum_holding", 0)
-    nft_collection_id = cfg.get("nft_collection_id", "")
-    nft_threshold = cfg.get("nft_threshold", 1)
     registration_mode = cfg.get("registration_mode", "token")
-    nft_trait_name = cfg.get("nft_trait_name", "")
-    nft_trait_value = cfg.get("nft_trait_value", "")
-    nft_trait_threshold = cfg.get("nft_trait_threshold", 1)
-
-    # Show processing message for user feedback
-    processing_msg = bot.reply_to(
-        message,
-        "⏳ Verifying wallet balances and NFT ownership..."
-    )
+    processing_msg = bot.reply_to(message, "⏳ Verifying wallet balances and NFT ownership...")
 
     try:
-        # 4️⃣ Check wallet balances
-        wallet_lower = wallet_address.lower()
-        token_valid = False
-        nft_valid = False
-        trait_valid = True
-        token_balance = 0
-        nft_count = 0
-        trait_count = 0
-        trait_api_failed = False
+        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
 
-        # Check token requirements if applicable
-        if registration_mode in ["token", "both"]:
-            if token:
-                balances = fetch_wallet_balances([wallet_lower], token, decimals)
-                token_balance = balances.get(wallet_lower, 0) or 0
-                token_valid = token_balance >= minimum
-
-        # Check NFT requirements if applicable
-        if registration_mode in ["nft", "both"]:
-            if nft_collection_id:
-                nft_count = get_user_nft_count([wallet_lower], nft_collection_id)
-                nft_valid = nft_count >= nft_threshold
-                
-                # Check trait requirements if configured
-                if nft_trait_name and nft_valid:
-                    try:
-                        if nft_trait_value:
-                            trait_count = get_user_nft_trait_count(
-                                [wallet_lower],
-                                nft_collection_id,
-                                nft_trait_name,
-                                nft_trait_value
-                            )
-                        else:
-                            trait_count = get_user_nft_category_count(
-                                [wallet_lower],
-                                nft_collection_id,
-                                nft_trait_name
-                            )
-                        
-                        if trait_count is None:
-                            logging.warning(f"Trait API returned None for user {user_id}, allowing through (safety)")
-                            trait_api_failed = True
-                            trait_valid = True
-                        else:
-                            trait_valid = trait_count >= nft_trait_threshold
-                    except Exception as trait_e:
-                        logging.warning(f"Trait check failed for user {user_id}, allowing through: {trait_e}")
-                        trait_api_failed = True
-                        trait_valid = True
-
-        # 5️⃣ Validate requirements
-        requirements_met = False
-        if registration_mode == "token":
-            requirements_met = token_valid
-        elif registration_mode == "nft":
-            requirements_met = nft_valid and trait_valid
-        elif registration_mode == "both":
-            requirements_met = token_valid or (nft_valid and trait_valid)
-
-        if not requirements_met:
-            error_msg = "❌ Wallet doesn't meet requirements:\n\n"
-
-            if registration_mode in ["token", "both"] and token:
-                error_msg += f"💰 Token balance: {token_balance:,.2f} (Required: {minimum:,.2f})\n"
-
-            if registration_mode in ["nft", "both"] and nft_collection_id:
-                error_msg += f"🖼️ NFTs held: {nft_count} (Required: {nft_threshold})\n"
-                
-                if nft_trait_name and nft_valid and not trait_valid:
-                    trait_desc = f"{nft_trait_name}"
-                    if nft_trait_value:
-                        trait_desc += f" = {nft_trait_value}"
-                    error_msg += f"🎨 NFTs with trait `{trait_desc}`: {trait_count} (Required: {nft_trait_threshold})\n"
-
+        if not requirement_eval["requirements_met"]:
+            error_msg = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
+                requirement_eval["errors"] or ["Please retry after updating your holdings."]
+            )
+            if requirement_eval["details"]:
+                error_msg += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
             if registration_mode == "both":
-                error_msg += "\n_You need to meet either the token OR NFT requirement._"
+                error_msg += "\n\n_You need to meet either the token OR NFT requirement._"
 
             bot.edit_message_text(
                 error_msg,
@@ -3652,23 +3383,23 @@ def register_wallets(message):
             )
             return
 
-        # 6️⃣ Requirements met - initiate verification process
-        # Store verification data
         with get_db_cursor() as (conn, cur):
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO pending_verifications (user_id, group_id, wallet_address, created_at)
                 VALUES (%s, %s, %s, NOW())
                 ON CONFLICT (user_id) DO UPDATE SET
                     group_id = EXCLUDED.group_id,
                     wallet_address = EXCLUDED.wallet_address,
                     created_at = EXCLUDED.created_at
-            """, (user_id, group_id, wallet_address))
+                """,
+                (user_id, group_id, wallet_address)
+            )
 
-        # Get group name for message
         try:
             chat_obj = bot.get_chat(group_id)
             group_name = chat_obj.title
-        except:
+        except Exception:
             group_name = f"Group {group_id}"
 
         verification_message = (
@@ -3677,30 +3408,13 @@ def register_wallets(message):
             f"🏆 Group: {group_name}\n\n"
             "**Verification Details:**\n"
         )
+        if requirement_eval["details"]:
+            verification_message += "\n".join(requirement_eval["details"]) + "\n\n"
 
-        if registration_mode in ["token", "both"] and token_valid:
-            verification_message += f"💰 Token balance: {token_balance:,.2f} ✅\n\n"
-
-        if registration_mode in ["nft", "both"] and nft_valid:
-            verification_message += f"🖼️ NFT Collection: {nft_count} NFT(s) found ✅ (threshold: {nft_threshold})\n"
-            
-            if nft_trait_name:
-                trait_desc = f"{nft_trait_name}"
-                if nft_trait_value:
-                    trait_desc += f" = {nft_trait_value}"
-                
-                if trait_api_failed:
-                    verification_message += f"🎨 Trait `{trait_desc}`: ⚠️ Check unavailable (allowed through)\n"
-                else:
-                    verification_message += f"🎨 Trait `{trait_desc}`: {trait_count} NFT(s) found ✅ (threshold: {nft_trait_threshold})\n"
-
-        verification_message += "\n"
         verification_message += (
-            "**🔐 Final Step - Ownership Verification:**\n\n"
-            f"To verify wallet control, send at least **{VERIFICATION_AMOUNT} SUI** to:\n\n"
-            f"`{DONATION_ADDRESS} (Lofi Foundation)`\n\n"
-            "_(Additional donations are welcome but not required)_\n\n"
-            "After sending, click the button below to complete verification.\n\n"
+            "**🔐 Final Step - On-Chain Verification:**\n\n"
+            "Click the button below to re-check your on-chain holdings and finalize registration.\n\n"
+            "No transfer is required.\n\n"
             f"⏰ _Verification expires in {VERIFICATION_TIMEOUT // 60} minutes._"
         )
 
@@ -3806,81 +3520,6 @@ def is_valid_wallet_address(address):
         return False
 
 # ==================== New Functions =============================
-
-def verify_transfer_between_addresses(from_address, to_address, min_amount, verified_transactions):
-    """
-    Verify that a transfer occurred between two addresses using InsideX API with robust error handling.
-    Returns the transaction details if a valid transfer is found, None otherwise.
-    """
-    try:
-        # Validate input addresses
-        if not from_address or not to_address:
-            logging.error(f"Invalid addresses provided: from_address={from_address}, to_address={to_address}")
-            return None
-
-        if not isinstance(from_address, str) or not isinstance(to_address, str):
-            logging.error(f"Addresses must be strings: from_address={type(from_address)}, to_address={type(to_address)}")
-            return None
-
-        url = f'https://api-ex.insidex.trade/coins-transfer/transfers-between-addresses/{from_address.lower()}/{to_address.lower()}'
-
-        logging.info(f"Checking transfers from {from_address} to {to_address}")
-
-        try:
-            response = make_api_request_with_retry(insidex_session, url, max_retries=3)
-        except Exception as e:
-            logging.error(f"Failed to fetch transfer data after retries: {e}")
-            return None
-
-        if response.status_code == 200:
-            data = response.json()
-            if data and isinstance(data, list):
-                # Look for SUI transfers that meet our criteria
-                sui_coin_type = "0x2::sui::SUI"
-
-                for transfer in data:
-                    # Check if this is a SUI transfer
-                    if transfer.get('coin') != sui_coin_type:
-                        continue
-
-                    # Check the amount (API returns in smallest units)
-                    amount_raw = transfer.get('amount', 0)
-                    amount_sui = float(amount_raw) / (10 ** 9)  # Convert to SUI
-
-                    # Check if amount meets minimum requirement
-                    if amount_sui < min_amount:
-                        continue
-
-                    # Check if we've already used this transaction
-                    transaction_id = transfer.get('_id')
-                    if transaction_id in verified_transactions:
-                        continue
-
-                    # Verify the from and to addresses match
-                    if (transfer.get('from', '').lower() == from_address.lower() and 
-                        transfer.get('to', '').lower() == to_address.lower()):
-
-                        logging.info(f"Found valid transfer: {amount_sui} SUI from {from_address} to {to_address}, ID: {transaction_id}")
-                        return {
-                            'transaction_id': transaction_id,
-                            'amount': amount_sui,
-                            'from': transfer.get('from'),
-                            'to': transfer.get('to'),
-                            'coin': transfer.get('coin')
-                        }
-
-                logging.info(f"No valid new transfers found from {from_address} to {to_address}")
-                return None
-            else:
-                logging.warning(f"Empty or invalid response for transfer check: {data}")
-                return None
-        else:
-            logging.error(f"Transfer check API call failed: {response.status_code}")
-            return None
-
-    except Exception as e:
-        logging.error(f"Error checking transfers from {from_address} to {to_address}: {e}")
-        return None
 
 # ==================== Main Execution =============================
 # Global application start time for uptime tracking
