@@ -52,8 +52,10 @@ logging.getLogger().setLevel(logging.INFO)
 # ==================== Bot and Flask Configuration =================
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 SUI_RPC_URL = os.getenv('SUI_RPC_URL', 'https://fullnode.mainnet.sui.io:443')
+WALLET_CONNECT_URL = os.getenv('WALLET_CONNECT_URL', '').strip()
 
 BOT_NAME = "GuildSafeBot"
+CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-25"
 
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
@@ -668,15 +670,17 @@ def sui_rpc_request(method: str, params, max_retries: int = 3):
     return make_api_request_with_retry(do_request, max_retries=max_retries)
 
 
-def fetch_wallet_balances(addresses, monitored_token, decimals, retry_on_zero=True):
+def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, cache_ttl=None):
     """Fetch token balances directly from Sui RPC (on-chain), no third-party indexers."""
     results = {}
     current_time = time.time()
     cache_key = f"{','.join(sorted(addresses))}|{monitored_token}|{decimals}"
 
-    if cache_key in balance_cache:
+    effective_cache_ttl = CACHE_TTL if cache_ttl is None else cache_ttl
+
+    if use_cache and cache_key in balance_cache:
         cache_time, cache_result = balance_cache[cache_key]
-        if current_time - cache_time < CACHE_TTL:
+        if current_time - cache_time < effective_cache_ttl:
             return cache_result
 
     for wallet in addresses:
@@ -1521,7 +1525,7 @@ def handle_verify_wallet_callback(call):
                 )
                 return
 
-            requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id)
+            requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
             if not requirement_eval["requirements_met"]:
                 error_text = "❌ *Wallet Requirements Not Met*\n\n" + "\n".join(
                     requirement_eval["errors"] or ["Please retry after updating your holdings."]
@@ -2459,16 +2463,18 @@ def calculate_user_vote_weight(group_id, user_id):
         logging.error(f"Error calculating vote weight for user {user_id}: {e}")
         return 0
 
-def get_user_nft_count(addresses, collection_id):
+def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None):
     """Count NFTs for addresses via on-chain Sui owned-object queries."""
     current_time = time.time()
     normalized_addresses = [addr.lower() for addr in addresses if addr]
     collection_hint = (collection_id or "").strip().lower()
     cache_key = (tuple(sorted(normalized_addresses)), collection_hint)
 
-    if cache_key in nft_cache:
+    effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
+
+    if use_cache and cache_key in nft_cache:
         cache_time, cache_result = nft_cache[cache_key]
-        if current_time - cache_time < NFT_CACHE_TTL:
+        if current_time - cache_time < effective_cache_ttl:
             return cache_result
 
     def matches_collection(object_id: str, object_type: str) -> bool:
@@ -2537,7 +2543,7 @@ def check_nft_ownership(addresses, collection_id, threshold):
     return total_nft_count >= threshold
 
 
-def evaluate_wallet_requirements(wallet_address, cfg, user_id=None):
+def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=False):
     """Evaluate configured token/NFT requirements for a wallet and return structured status."""
     wallet_lower = wallet_address.lower()
     registration_mode = cfg.get("registration_mode", "token")
@@ -2558,8 +2564,9 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None):
     trait_valid = True
 
     token_balance = None
+    verification_ttl = VERIFICATION_CACHE_TTL if force_fresh else None
     if registration_mode in ["token", "both"] and token:
-        balances = fetch_wallet_balances([wallet_lower], token, decimals)
+        balances = fetch_wallet_balances([wallet_lower], token, decimals, use_cache=True, cache_ttl=verification_ttl)
         token_balance = balances.get(wallet_lower)
         if token_balance is None:
             errors.append("⚠️ Unable to verify token balance right now. Please retry in a moment.")
@@ -2572,7 +2579,7 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None):
     trait_api_failed = False
 
     if registration_mode in ["nft", "both"] and nft_collection_id:
-        nft_count = get_user_nft_count([wallet_lower], nft_collection_id)
+        nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=True, cache_ttl=verification_ttl)
         nft_valid = nft_count >= nft_threshold
         details.append(f"*NFTs in Collection:* {nft_count} {'✓' if nft_valid else '✗'} (threshold: {nft_threshold})")
 
@@ -3224,7 +3231,7 @@ def confirm_verification(message):
             bot.edit_message_text("❌ This group isn't set up yet. Ask an admin to run /gsconfig first.", chat_id=message.chat.id, message_id=processing_msg.message_id)
             return
 
-        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id)
+        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
         if not requirement_eval["requirements_met"]:
             error_text = "❌ *Wallet Requirements Not Met*\n\n" + "\n".join(requirement_eval["errors"] or ["Please retry after updating your holdings."])
             if requirement_eval["details"]:
@@ -3262,8 +3269,9 @@ def confirm_verification(message):
 
         if message.chat.type == 'private':
             try:
-                invite = bot.export_chat_invite_link(group_id)
-                text_lines += ["", "*Group Invite Link:*", f"[Join {group_name}]({invite})", "_Use this link to join or return to the group._"]
+                invite = create_single_use_invite_link(group_id)
+                if invite:
+                    text_lines += ["", "*Group Invite Link:*", f"[Join {group_name}]({invite})", "_Use this link to join or return to the group._"]
             except Exception as e:
                 logging.error(f"Error fetching invite link: {e}")
             text_lines += ["", "💡 *Want to add another wallet?*", "Use `/register 0x123...abc` to add additional wallets to your account."]
@@ -3282,12 +3290,16 @@ def confirm_verification(message):
 
 def build_wallet_connect_url(group_id, user_id):
     """Build a wallet-connect URL for external wallet sign-in flow."""
-    if not WALLET_CONNECT_URL:
+    base_url = globals().get("WALLET_CONNECT_URL")
+    if base_url is None:
+        base_url = os.getenv('WALLET_CONNECT_URL', '').strip()
+
+    if not base_url:
         return None
 
-    separator = '&' if '?' in WALLET_CONNECT_URL else '?'
+    separator = '&' if '?' in base_url else '?'
     return (
-        f"{WALLET_CONNECT_URL}{separator}group_id={group_id}"
+        f"{base_url}{separator}group_id={group_id}"
         f"&tg_user_id={user_id}"
     )
 
@@ -3336,7 +3348,14 @@ def register_wallets(message):
         markup.add(types.InlineKeyboardButton("📱 Continue in Private Chat", url=deep_link))
 
         message_thread_id = getattr(message, 'message_thread_id', None)
-        register_text = "🔐 **Wallet Registration**\n\nFor security, wallet registration must be completed in private chat:"
+        register_text = (
+            "🔐 **Wallet Registration**\n\n"
+            "1. Click **Connect Wallet** (opens wallet sign-in if supported).\n"
+            "2. Return to private chat to complete wallet submission if prompted.\n"
+            "3. The bot verifies your holdings on-chain and confirms registration.\n\n"
+            "After you register one wallet, use **/mywallets** to add additional wallets."
+        )
+
         if message_thread_id:
             bot.send_message(
                 message.chat.id,
@@ -3388,7 +3407,7 @@ def register_wallets(message):
     processing_msg = bot.reply_to(message, "⏳ Verifying wallet balances and NFT ownership...")
 
     try:
-        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id)
+        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
 
         if not requirement_eval["requirements_met"]:
             error_msg = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
