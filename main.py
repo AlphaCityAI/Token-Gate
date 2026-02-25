@@ -3319,7 +3319,7 @@ def register_wallets(message):
             return bot.reply_to(
                 message,
                 "⚠️ No group registration context found.\n\n"
-                "Please click the registration link from your group first."
+                "Please run /register in your target group first."
             )
         group_id = result[0]
     else:
@@ -3338,22 +3338,23 @@ def register_wallets(message):
                 (user_id, group_id)
             )
 
-        markup = types.InlineKeyboardMarkup()
-        deep_link = f"https://t.me/{bot.get_me().username}?start=register_{group_id}"
         connect_url = build_wallet_connect_url(group_id, user_id)
+        if not connect_url:
+            return bot.reply_to(
+                message,
+                "❌ Wallet connect is not configured for this bot yet.\n"
+                "Please ask an admin to set `WALLET_CONNECT_URL`."
+            )
 
-        if connect_url:
-            markup.add(types.InlineKeyboardButton("🔗 Connect Wallet", url=connect_url))
-
-        markup.add(types.InlineKeyboardButton("📱 Continue in Private Chat", url=deep_link))
+        webapp_url = f"{connect_url}&source=telegram_register"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
 
         message_thread_id = getattr(message, 'message_thread_id', None)
         register_text = (
             "🔐 **Wallet Registration**\n\n"
-            "1. Click **Connect Wallet** (opens wallet sign-in if supported).\n"
-            "2. Return to private chat to complete wallet submission if prompted.\n"
-            "3. The bot verifies your holdings on-chain and confirms registration.\n\n"
-            "After you register one wallet, use **/mywallets** to add additional wallets."
+            "Tap **Verify Wallet** to open your wallet and sign in.\n"
+            "After successful sign-in, your wallet will be verified on-chain automatically."
         )
 
         if message_thread_id:
@@ -3484,6 +3485,91 @@ def register_wallets(message):
             )
         except Exception:
             pass
+
+
+@db_retry
+@bot.message_handler(content_types=['web_app_data'])
+def handle_wallet_webapp_data(message):
+    """Handle wallet verification payload coming back from Telegram WebApp."""
+    user_id = message.from_user.id
+    payload_raw = getattr(message.web_app_data, 'data', '') if getattr(message, 'web_app_data', None) else ''
+
+    try:
+        payload = json.loads(payload_raw) if payload_raw else {}
+    except Exception:
+        payload = {}
+
+    wallet_address = (payload.get('wallet_address') or payload.get('address') or '').strip()
+    payload_group_id = payload.get('group_id')
+
+    if not is_valid_wallet_address(wallet_address):
+        bot.reply_to(message, "❌ Wallet verification failed: invalid wallet payload from WebApp.")
+        return
+
+    group_id = None
+    if payload_group_id:
+        try:
+            group_id = int(payload_group_id)
+        except Exception:
+            group_id = None
+
+    if group_id is None:
+        with get_db_cursor() as (conn, cur):
+            cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+        if row:
+            group_id = row[0]
+
+    if group_id is None:
+        bot.reply_to(message, "❌ No registration context found. Please run /register in the target group first.")
+        return
+
+    if wallet_already_registered(wallet_address, group_id):
+        bot.reply_to(message, "⚠️ This wallet address is already registered for this group.")
+        return
+
+    with config_lock:
+        cfg = SUBSCRIBER_CONFIGS.get(group_id)
+    if not cfg:
+        bot.reply_to(message, "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.")
+        return
+
+    requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+    if not requirement_eval["requirements_met"]:
+        error_text = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
+            requirement_eval["errors"] or ["Please retry after updating your holdings."]
+        )
+        if requirement_eval["details"]:
+            error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
+        bot.reply_to(message, error_text, parse_mode="Markdown")
+        return
+
+    success = save_wallet_for_user(
+        group_id,
+        user_id,
+        message.from_user.username or message.from_user.first_name,
+        [wallet_address.lower()],
+        replace_existing=False
+    )
+
+    if not success:
+        bot.reply_to(message, "❌ Failed to save your wallet. Please try again later.")
+        return
+
+    with get_db_cursor() as (conn, cur):
+        cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (user_id,))
+
+    msg_lines = [
+        "✅ *Wallet Verification Successful!*",
+        f"*Wallet:* `{wallet_address}`",
+        "",
+        "Use `/mywallets` any time if you want to add an additional wallet."
+    ]
+    if requirement_eval["details"]:
+        msg_lines += ["", "📋 *Verification Details:*"] + requirement_eval["details"]
+
+    bot.reply_to(message, "\n".join(msg_lines), parse_mode="Markdown")
+
 
 # ==================== Flask API Endpoints ========================
 @app.route('/')
