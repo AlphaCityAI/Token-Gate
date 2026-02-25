@@ -53,9 +53,10 @@ logging.getLogger().setLevel(logging.INFO)
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 SUI_RPC_URL = os.getenv('SUI_RPC_URL', 'https://fullnode.mainnet.sui.io:443')
 WALLET_CONNECT_URL = os.getenv('WALLET_CONNECT_URL', '').strip()
+HARDCODED_WALLET_CONNECT_URL = 'https://wallet-connect.guildsafe.bot/sui'
 
 BOT_NAME = "GuildSafeBot"
-CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-25"
+CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26"
 
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
@@ -3295,7 +3296,7 @@ def build_wallet_connect_url(group_id, user_id):
         base_url = os.getenv('WALLET_CONNECT_URL', '').strip()
 
     if not base_url:
-        return None
+        base_url = HARDCODED_WALLET_CONNECT_URL
 
     separator = '&' if '?' in base_url else '?'
     return (
@@ -3339,13 +3340,6 @@ def register_wallets(message):
             )
 
         connect_url = build_wallet_connect_url(group_id, user_id)
-        if not connect_url:
-            return bot.reply_to(
-                message,
-                "❌ Wallet connect is not configured for this bot yet.\n"
-                "Please ask an admin to set `WALLET_CONNECT_URL`."
-            )
-
         webapp_url = f"{connect_url}&source=telegram_register"
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
