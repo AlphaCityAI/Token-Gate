@@ -3342,7 +3342,13 @@ def register_wallets(message):
         connect_url = build_wallet_connect_url(group_id, user_id)
         webapp_url = f"{connect_url}&source=telegram_register"
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
+
+        if is_private:
+            # Telegram supports WebApp buttons in private chats.
+            markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
+        else:
+            # In group chats, WebApp button type may be rejected (BUTTON_TYPE_INVALID), so use URL button.
+            markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=webapp_url))
 
         message_thread_id = getattr(message, 'message_thread_id', None)
         register_text = (
