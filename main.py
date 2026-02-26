@@ -1,5 +1,6 @@
 import telebot
 import os
+import html as html_module
 import logging
 import json
 import sys
@@ -57,7 +58,7 @@ PUBLIC_WEBAPP_BASE_URL = os.getenv('PUBLIC_WEBAPP_BASE_URL', '').strip()
 HARDCODED_WALLET_CONNECT_URL = 'https://alphacity.tech/verify'
 
 BOT_NAME = "GuildSafeBot"
-CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26b"
+CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
 
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
@@ -3122,7 +3123,19 @@ def handle_start(message):
                             created_at = EXCLUDED.created_at,
                             wallet_address = NULL
                     """, (message.from_user.id, group_id))
-                bot.reply_to(message, "Please register your wallet address for this group using the /register command.\nFormat: /register 0x123...abc")
+                # Show verify button directly in private chat (WebApp buttons work here)
+                with config_lock:
+                    group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
+                connect_url = build_wallet_connect_url(group_id, message.from_user.id, cfg=group_cfg)
+                webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
+                bot.reply_to(
+                    message,
+                    "🔐 *Wallet Registration*\n\nTap **Verify Wallet** to connect your Sui wallet and verify your token/NFT holdings for this group.",
+                    reply_markup=markup,
+                    parse_mode="Markdown"
+                )
             except ValueError:
                 bot.reply_to(message, "Invalid registration parameter.")
 
@@ -3638,16 +3651,70 @@ def handle_wallet_webapp_data(message):
     with get_db_cursor() as (conn, cur):
         cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (user_id,))
 
-    msg_lines = [
-        "✅ *Wallet Verification Successful!*",
-        f"*Wallet:* `{wallet_address}`",
-        "",
-        "Use `/mywallets` any time if you want to add an additional wallet."
-    ]
-    if requirement_eval["details"]:
-        msg_lines += ["", "📋 *Verification Details:*"] + requirement_eval["details"]
+    msg_lines, group_name = _build_verification_success_message(group_id, wallet_address, requirement_eval)
+    bot.reply_to(message, "\n".join(msg_lines), parse_mode="Markdown", disable_web_page_preview=True)
 
-    bot.reply_to(message, "\n".join(msg_lines), parse_mode="Markdown")
+    user = message.from_user
+    display_name = f"@{user.username}" if user.username else (user.first_name or str(user.id))
+    _send_group_verified_notification(group_id, display_name)
+
+
+# ==================== Verification Helper Functions ==============
+
+def _get_user_display_name(tg_user_id):
+    """Resolve a Telegram user's display name from their user ID (best-effort)."""
+    username = str(tg_user_id)
+    try:
+        user_info = bot.get_chat(tg_user_id)
+        username = user_info.username or user_info.first_name or str(tg_user_id)
+    except Exception:
+        pass
+    return username
+
+
+def _build_verification_success_message(group_id, wallet_address, requirement_eval):
+    """Build the Markdown success message lines for a completed wallet verification.
+
+    Returns a list of message lines and the group display name.
+    """
+    group_name = f"Group {group_id}"
+    try:
+        group_name = bot.get_chat(group_id).title
+    except Exception:
+        pass
+
+    text_lines = [
+        "✅ *Wallet Verification Successful!*",
+        "",
+        f"*Group:* {group_name}",
+        f"*Wallet:* `{wallet_address}`",
+    ]
+    if requirement_eval.get("details"):
+        text_lines += ["", "📋 *Verification Details:*"] + requirement_eval["details"]
+    text_lines += ["", "Your wallet has been registered! You can now participate in group activities.",
+                   "Use `/mywallets` any time if you want to add an additional wallet."]
+
+    try:
+        invite = create_single_use_invite_link(group_id)
+        if invite:
+            text_lines += [
+                "",
+                "*Group Invite Link:*",
+                f"[Join {group_name}]({invite})",
+                "_Use this link to join or return to the group._"
+            ]
+    except Exception as e:
+        logging.error(f"Error creating invite link for group {group_id}: {e}")
+
+    return text_lines, group_name
+
+
+def _send_group_verified_notification(group_id, display_name):
+    """Send a notification to the group that a user has verified their wallet."""
+    try:
+        bot.send_message(group_id, f"✅ {display_name} has verified their wallet and is now registered!")
+    except Exception as e:
+        logging.warning(f"Could not send group verification notification for group {group_id}: {e}")
 
 
 # ==================== Flask API Endpoints ========================
@@ -3663,9 +3730,19 @@ def home():
 @app.route('/wallet-connect')
 @app.route('/verify')
 def wallet_connect_webapp():
-    """Minimal Telegram WebApp for wallet submission/sign-in handoff."""
-    group_id = request.args.get('group_id', '')
-    tg_user_id = request.args.get('tg_user_id', '')
+    """Telegram WebApp / external-browser page for wallet verification."""
+    group_id = request.args.get('group_id', '') or request.args.get('groupId', '')
+    tg_user_id = request.args.get('tg_user_id', '') or request.args.get('tgUserId', '')
+
+    # Sanitize to digits-only to prevent XSS – these are numeric IDs.
+    safe_group_id = re.sub(r'[^0-9\-]', '', group_id)
+    safe_tg_user_id = re.sub(r'[^0-9\-]', '', tg_user_id)
+    # HTML-escaped versions for the visible hint text
+    hint_group = html_module.escape(safe_group_id)
+    hint_user = html_module.escape(safe_tg_user_id)
+    # JSON-encoded strings for safe embedding in JavaScript literals
+    js_group_id = json.dumps(safe_group_id)
+    js_tg_user_id = json.dumps(safe_tg_user_id)
 
     html = f"""
 <!doctype html>
@@ -3676,45 +3753,93 @@ def wallet_connect_webapp():
   <title>GuildSafe Wallet Verify</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
-    body {{ font-family: Arial, sans-serif; padding: 16px; background: #0f172a; color: #e2e8f0; }}
-    .card {{ max-width: 480px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 16px; }}
-    input {{ width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #475569; background: #0b1220; color: #e2e8f0; }}
-    button {{ margin-top: 12px; width: 100%; padding: 12px; border: 0; border-radius: 8px; background: #22c55e; color: #052e16; font-weight: 700; }}
+    body {{ font-family: Arial, sans-serif; padding: 16px; background: #0f172a; color: #e2e8f0; margin: 0; }}
+    .card {{ max-width: 480px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 20px; }}
+    h3 {{ margin-top: 0; }}
+    input {{ width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #475569; background: #0b1220; color: #e2e8f0; box-sizing: border-box; font-size: 14px; }}
+    button {{ margin-top: 12px; width: 100%; padding: 12px; border: 0; border-radius: 8px; background: #22c55e; color: #052e16; font-weight: 700; font-size: 15px; cursor: pointer; }}
+    button:disabled {{ opacity: 0.55; cursor: not-allowed; }}
     .hint {{ color: #94a3b8; font-size: 12px; margin-top: 8px; }}
     .row {{ display: grid; gap: 8px; }}
+    .status {{ margin-top: 14px; padding: 12px; border-radius: 8px; font-size: 14px; display: none; }}
+    .status.success {{ background: #14532d; color: #86efac; display: block; }}
+    .status.error {{ background: #450a0a; color: #fca5a5; display: block; }}
+    .label {{ font-size: 13px; color: #94a3b8; margin-bottom: 4px; }}
   </style>
 </head>
 <body>
-  <div class="card"> 
-    <h3>Verify Wallet</h3>
-    <p>Connect/sign in with your Sui wallet, then submit your wallet address.</p>
+  <div class="card">
+    <h3>🔐 Verify Wallet</h3>
+    <p>Enter your Sui wallet address to verify token/NFT holdings for this group.</p>
     <div class="row">
-      <input id="wallet" placeholder="0x..." autocomplete="off" />
+      <div>
+        <div class="label">Wallet Address (any Sui wallet)</div>
+        <input id="wallet" placeholder="0x..." autocomplete="off" spellcheck="false" />
+      </div>
       <button id="submitBtn">Submit Wallet</button>
     </div>
-    <p class="hint">Group: {group_id} · User: {tg_user_id}</p>
+    <p class="hint">Group: {hint_group} · User: {hint_user}</p>
+    <div id="status" class="status"></div>
   </div>
   <script>
     const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+    // isWebApp is true only when genuinely running inside a Telegram WebApp context
+    // (tg.initData is non-empty only in that case).
+    const isWebApp = !!(tg && tg.initData && tg.initData.length > 0);
     if (tg) tg.ready();
+
+    const GROUP_ID = {js_group_id};
+    const TG_USER_ID = {js_tg_user_id};
 
     function isValid(addr) {{
       return /^0x[0-9a-fA-F]{{40,64}}$/.test((addr || '').trim());
     }}
 
-    document.getElementById('submitBtn').addEventListener('click', () => {{
+    function showStatus(msg, type) {{
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = 'status ' + type;
+    }}
+
+    document.getElementById('submitBtn').addEventListener('click', async () => {{
       const wallet = document.getElementById('wallet').value.trim();
       if (!isValid(wallet)) {{
-        alert('Invalid wallet format. Use a Sui 0x address.');
+        showStatus('Invalid wallet format. Please enter a valid Sui 0x address.', 'error');
         return;
       }}
 
-      const payload = JSON.stringify({{ wallet_address: wallet, group_id: '{group_id}' }});
-      if (tg && tg.sendData) {{
-        tg.sendData(payload);
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = true;
+      btn.textContent = 'Verifying…';
+
+      const payload = {{ wallet_address: wallet, group_id: GROUP_ID, tg_user_id: TG_USER_ID }};
+
+      if (isWebApp) {{
+        // Inside Telegram WebApp: send data back via Telegram API, then close.
+        tg.sendData(JSON.stringify(payload));
         tg.close();
       }} else {{
-        alert('This page must be opened inside Telegram WebApp.');
+        // External browser (e.g. URL button from group chat): POST to bot API.
+        try {{
+          const resp = await fetch('/api/verify', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify(payload)
+          }});
+          const result = await resp.json();
+          if (result.success) {{
+            showStatus('✅ Wallet verified! Check your Telegram for a confirmation message and group invite link.', 'success');
+            btn.textContent = 'Verified!';
+          }} else {{
+            showStatus('❌ ' + (result.error || 'Verification failed. Please try again.'), 'error');
+            btn.disabled = false;
+            btn.textContent = 'Submit Wallet';
+          }}
+        }} catch (e) {{
+          showStatus('❌ Network error. Please check your connection and try again.', 'error');
+          btn.disabled = false;
+          btn.textContent = 'Submit Wallet';
+        }}
       }}
     }});
   </script>
@@ -3722,6 +3847,103 @@ def wallet_connect_webapp():
 </html>
     """
     return html
+
+
+@app.route('/api/verify', methods=['POST'])
+def api_verify():
+    """REST endpoint for wallet verification submitted from an external browser.
+
+    The /verify page POSTs here when it detects it is NOT running inside a
+    Telegram WebApp (i.e. the URL-button flow from a group chat).  The endpoint
+    validates the wallet, saves it, and sends the confirmation (plus an invite
+    link) to the user via the Telegram bot.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        wallet_address = (
+            data.get('wallet_address') or data.get('walletAddress') or ''
+        ).strip()
+
+        try:
+            group_id = int(data.get('group_id') or data.get('groupId') or 0)
+        except (ValueError, TypeError):
+            group_id = 0
+
+        try:
+            tg_user_id = int(data.get('tg_user_id') or data.get('tgUserId') or 0)
+        except (ValueError, TypeError):
+            tg_user_id = 0
+
+        if not is_valid_wallet_address(wallet_address):
+            return jsonify({'success': False, 'error': 'Invalid wallet address'}), 400
+
+        if not tg_user_id:
+            return jsonify({'success': False, 'error': 'Missing Telegram user ID'}), 400
+
+        # Look up group_id from pending_verifications if not supplied
+        if not group_id:
+            with get_db_cursor() as (conn, cur):
+                cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (tg_user_id,))
+                row = cur.fetchone()
+            if row:
+                group_id = row[0]
+
+        if not group_id:
+            return jsonify({'success': False, 'error': 'No registration context found. Please run /register in the target group first.'}), 400
+
+        if wallet_already_registered(wallet_address, group_id):
+            try:
+                bot.send_message(tg_user_id, "⚠️ This wallet address is already registered for this group.")
+            except Exception:
+                pass
+            return jsonify({'success': False, 'error': 'Wallet already registered for this group'}), 409
+
+        with config_lock:
+            cfg = SUBSCRIBER_CONFIGS.get(group_id)
+        if not cfg:
+            return jsonify({'success': False, 'error': 'Group is not configured. Ask an admin to run /gsconfig first.'}), 400
+
+        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
+
+        if not requirement_eval['requirements_met']:
+            error_msg = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
+                requirement_eval['errors'] or ['Please retry after updating your holdings.']
+            )
+            if requirement_eval.get('details'):
+                error_msg += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval['details'])
+            try:
+                bot.send_message(tg_user_id, error_msg, parse_mode='Markdown')
+            except Exception:
+                pass
+            return jsonify({'success': False, 'error': 'Wallet does not meet group requirements', 'details': requirement_eval.get('errors', [])}), 403
+
+        # Resolve display name (best-effort)
+        username = _get_user_display_name(tg_user_id)
+
+        success = save_wallet_for_user(group_id, tg_user_id, username, [wallet_address.lower()], replace_existing=False)
+        if not success:
+            return jsonify({'success': False, 'error': 'Failed to save wallet. Please try again later.'}), 500
+
+        with get_db_cursor() as (conn, cur):
+            cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (tg_user_id,))
+
+        # Send confirmation to user and notify the group
+        try:
+            text_lines, _ = _build_verification_success_message(group_id, wallet_address, requirement_eval)
+            bot.send_message(tg_user_id, "\n".join(text_lines), parse_mode='Markdown', disable_web_page_preview=True)
+        except Exception as e:
+            logging.error(f"api_verify: failed to send Telegram confirmation to user {tg_user_id}: {e}")
+
+        display_name = f"@{username}" if (username and not username.isdigit()) else f"user {tg_user_id}"
+        _send_group_verified_notification(group_id, display_name)
+
+        logging.info(f"api_verify: wallet {wallet_address} verified for user {tg_user_id} in group {group_id}")
+        return jsonify({'success': True, 'message': 'Wallet verified and registered successfully'})
+
+    except Exception as e:
+        logging.error(f"Error in api_verify: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
 
 @app.route('/health')
