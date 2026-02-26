@@ -53,10 +53,11 @@ logging.getLogger().setLevel(logging.INFO)
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 SUI_RPC_URL = os.getenv('SUI_RPC_URL', 'https://fullnode.mainnet.sui.io:443')
 WALLET_CONNECT_URL = os.getenv('WALLET_CONNECT_URL', '').strip()
-HARDCODED_WALLET_CONNECT_URL = 'https://wallet-connect.guildsafe.bot/sui'
+PUBLIC_WEBAPP_BASE_URL = os.getenv('PUBLIC_WEBAPP_BASE_URL', '').strip()
+HARDCODED_WALLET_CONNECT_URL = 'https://alphacity.tech/verify'
 
 BOT_NAME = "GuildSafeBot"
-CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26"
+CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26b"
 
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
@@ -1000,12 +1001,12 @@ def reminder_command(message):
 
         # Create inline keyboard with registration button
         markup = types.InlineKeyboardMarkup()
-        register_btn = types.InlineKeyboardButton("Register confidentially via private chat", url=reg_link)
+        register_btn = types.InlineKeyboardButton("Verify wallet for this group", url=reg_link)
         markup.add(register_btn)
 
         reminder_text = (
             "📢 Friendly Reminder! 📢\n"
-            "If you haven't already registered your wallet, please do so ASAP."
+            "If you haven't already registered your wallet, run /register in this group and complete wallet verification."
         )
 
         bot.send_message(
@@ -1027,10 +1028,9 @@ def help_command(message):
         "This bot helps manage group access based on token or NFT holdings.\n\n"
         "--- *For All Users* ---\n\n"
         "🔑 *How to Register:*\n"
-        "1. Click a registration link from the group or an admin.\n"
-        "2. You'll be taken to a private chat with me.\n"
-        "3. Use `/register` in-group and follow the registration button flow.\n"
-        "4. Complete wallet sign-in and on-chain holdings verification (no transfer required).\n\n"
+        "1. In your target group, run `/register` (optionally with a wallet address).\n"
+        "2. Follow the wallet verification button/WebApp flow.\n"
+        "3. Complete wallet sign-in and on-chain holdings verification (no transfer required).\n\n"
         "💼 *Manage Your Wallets:*\n"
         "`/mywallets` - View your registered wallets, check balances, and add or remove them securely in our private chat.\n\n"
         "--- *For Group Admins* ---\n\n"
@@ -3290,18 +3290,27 @@ def confirm_verification(message):
             pass
 
 def build_wallet_connect_url(group_id, user_id):
-    """Build a wallet-connect URL for external wallet sign-in flow."""
+    """Build a verification URL compatible with external wallet pages and Telegram WebApp."""
     base_url = globals().get("WALLET_CONNECT_URL")
     if base_url is None:
         base_url = os.getenv('WALLET_CONNECT_URL', '').strip()
+
+    # Prefer explicit config. Otherwise build from known public base URL envs.
+    if not base_url:
+        public_base = PUBLIC_WEBAPP_BASE_URL or os.getenv('RENDER_EXTERNAL_URL', '').strip() or os.getenv('PUBLIC_URL', '').strip()
+        if public_base:
+            base_url = f"{public_base.rstrip('/')}/verify"
 
     if not base_url:
         base_url = HARDCODED_WALLET_CONNECT_URL
 
     separator = '&' if '?' in base_url else '?'
+    # Include both snake_case and camelCase query keys for compatibility with external pages.
     return (
         f"{base_url}{separator}group_id={group_id}"
         f"&tg_user_id={user_id}"
+        f"&groupId={group_id}"
+        f"&tgUserId={user_id}"
     )
 
 
@@ -3340,7 +3349,7 @@ def register_wallets(message):
             )
 
         connect_url = build_wallet_connect_url(group_id, user_id)
-        webapp_url = f"{connect_url}&source=telegram_register"
+        webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
         markup = types.InlineKeyboardMarkup()
 
         if is_private:
@@ -3499,8 +3508,21 @@ def handle_wallet_webapp_data(message):
     except Exception:
         payload = {}
 
-    wallet_address = (payload.get('wallet_address') or payload.get('address') or '').strip()
-    payload_group_id = payload.get('group_id')
+    # Support multiple payload shapes from different WebApp/front-end implementations.
+    wallet_address = (
+        payload.get('wallet_address')
+        or payload.get('walletAddress')
+        or payload.get('address')
+        or (payload.get('data') or {}).get('wallet_address')
+        or (payload.get('data') or {}).get('walletAddress')
+        or ''
+    ).strip()
+    payload_group_id = (
+        payload.get('group_id')
+        or payload.get('groupId')
+        or (payload.get('data') or {}).get('group_id')
+        or (payload.get('data') or {}).get('groupId')
+    )
 
     if not is_valid_wallet_address(wallet_address):
         bot.reply_to(message, "❌ Wallet verification failed: invalid wallet payload from WebApp.")
@@ -3580,6 +3602,70 @@ def home():
             "bot_name": BOT_NAME,
             "subscriber_configs": SUBSCRIBER_CONFIGS
         })
+
+@app.route('/wallet-connect')
+@app.route('/verify')
+def wallet_connect_webapp():
+    """Minimal Telegram WebApp for wallet submission/sign-in handoff."""
+    group_id = request.args.get('group_id', '')
+    tg_user_id = request.args.get('tg_user_id', '')
+
+    html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GuildSafe Wallet Verify</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body {{ font-family: Arial, sans-serif; padding: 16px; background: #0f172a; color: #e2e8f0; }}
+    .card {{ max-width: 480px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 16px; }}
+    input {{ width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #475569; background: #0b1220; color: #e2e8f0; }}
+    button {{ margin-top: 12px; width: 100%; padding: 12px; border: 0; border-radius: 8px; background: #22c55e; color: #052e16; font-weight: 700; }}
+    .hint {{ color: #94a3b8; font-size: 12px; margin-top: 8px; }}
+    .row {{ display: grid; gap: 8px; }}
+  </style>
+</head>
+<body>
+  <div class="card"> 
+    <h3>Verify Wallet</h3>
+    <p>Connect/sign in with your Sui wallet, then submit your wallet address.</p>
+    <div class="row">
+      <input id="wallet" placeholder="0x..." autocomplete="off" />
+      <button id="submitBtn">Submit Wallet</button>
+    </div>
+    <p class="hint">Group: {group_id} · User: {tg_user_id}</p>
+  </div>
+  <script>
+    const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+    if (tg) tg.ready();
+
+    function isValid(addr) {{
+      return /^0x[0-9a-fA-F]{{40,64}}$/.test((addr || '').trim());
+    }}
+
+    document.getElementById('submitBtn').addEventListener('click', () => {{
+      const wallet = document.getElementById('wallet').value.trim();
+      if (!isValid(wallet)) {{
+        alert('Invalid wallet format. Use a Sui 0x address.');
+        return;
+      }}
+
+      const payload = JSON.stringify({{ wallet_address: wallet, group_id: '{group_id}' }});
+      if (tg && tg.sendData) {{
+        tg.sendData(payload);
+        tg.close();
+      }} else {{
+        alert('This page must be opened inside Telegram WebApp.');
+      }}
+    }});
+  </script>
+</body>
+</html>
+    """
+    return html
+
 
 @app.route('/health')
 def health_check():
@@ -3780,7 +3866,7 @@ if __name__ == "__main__":
                 telebot.types.BotCommand("reminder", "Send registration reminder (admins only)"),
                 telebot.types.BotCommand("exempt", "Exempt a user from wallet requirements (admins only)"),
                 telebot.types.BotCommand("addwallet", "Add wallet address for a user (admins only)"),
-                telebot.types.BotCommand("confirm", "Confirm wallet ownership")
+                telebot.types.BotCommand("confirm", "Finalize pending wallet verification")
             ]
             bot.set_my_commands(commands)
             logging.info("Bot commands registered successfully")
