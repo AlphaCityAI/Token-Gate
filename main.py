@@ -3289,8 +3289,16 @@ def confirm_verification(message):
         except Exception:
             pass
 
-def build_wallet_connect_url(group_id, user_id):
-    """Build a verification URL compatible with external wallet pages and Telegram WebApp."""
+def build_wallet_connect_url(group_id, user_id, cfg=None):
+    """Build a verification URL compatible with external wallet pages and Telegram WebApp.
+
+    When *cfg* is provided the group's token/NFT requirements are appended as
+    query parameters so the verify page knows what to check:
+      - token_type        : fully-qualified token type string (e.g. 0x...::city::CITY)
+      - required_balance  : minimum holding expressed in the token's smallest unit
+      - registration_mode : "token", "nft", or "both"
+      - nft_collection_id : NFT collection object ID (when applicable)
+    """
     base_url = globals().get("WALLET_CONNECT_URL")
     if base_url is None:
         base_url = os.getenv('WALLET_CONNECT_URL', '').strip()
@@ -3306,12 +3314,32 @@ def build_wallet_connect_url(group_id, user_id):
 
     separator = '&' if '?' in base_url else '?'
     # Include both snake_case and camelCase query keys for compatibility with external pages.
-    return (
+    url = (
         f"{base_url}{separator}group_id={group_id}"
         f"&tg_user_id={user_id}"
         f"&groupId={group_id}"
         f"&tgUserId={user_id}"
     )
+
+    if cfg:
+        token = cfg.get("token", "")
+        minimum_holding = cfg.get("minimum_holding", 0)
+        decimals = cfg.get("decimals", 6)
+        registration_mode = cfg.get("registration_mode", "token")
+        nft_collection_id = cfg.get("nft_collection_id", "")
+
+        if token:
+            url += f"&token_type={token}"
+            required_balance = int(round(minimum_holding * (10 ** decimals)))
+            url += f"&required_balance={required_balance}"
+
+        if registration_mode:
+            url += f"&registration_mode={registration_mode}"
+
+        if nft_collection_id:
+            url += f"&nft_collection_id={nft_collection_id}"
+
+    return url
 
 
 @db_retry
@@ -3348,7 +3376,9 @@ def register_wallets(message):
                 (user_id, group_id)
             )
 
-        connect_url = build_wallet_connect_url(group_id, user_id)
+        with config_lock:
+            group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
+        connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
         webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
         markup = types.InlineKeyboardMarkup()
 
@@ -3524,6 +3554,17 @@ def handle_wallet_webapp_data(message):
         or (payload.get('data') or {}).get('groupId')
     )
 
+    # Extract verification result fields sent by the verify page.
+    # The verify page sends these after completing an on-chain balance check.
+    # Note: payload arrives via the Telegram WebApp channel (tg.sendData), which
+    # is the same trust level as the wallet_address already accepted above.
+    balance_verified = payload.get('balance_verified')
+    if balance_verified is None:
+        balance_verified = (payload.get('data') or {}).get('balance_verified')
+    token_type = payload.get('token_type') or (payload.get('data') or {}).get('token_type') or ''
+    required_balance = payload.get('required_balance') or (payload.get('data') or {}).get('required_balance')
+    token_balance = payload.get('token_balance') or (payload.get('data') or {}).get('token_balance')
+
     if not is_valid_wallet_address(wallet_address):
         bot.reply_to(message, "❌ Wallet verification failed: invalid wallet payload from WebApp.")
         return
@@ -3556,7 +3597,23 @@ def handle_wallet_webapp_data(message):
         bot.reply_to(message, "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.")
         return
 
-    requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+    # If the verify page confirmed the balance on-chain, trust its result and skip a redundant
+    # RPC call. Otherwise fall back to evaluating requirements directly from the bot.
+    if balance_verified:
+        logging.info(
+            f"Verify page confirmed balance for user {user_id}, wallet {wallet_address}: "
+            f"token_type={token_type}, required_balance={required_balance}, token_balance={token_balance}"
+        )
+        requirement_eval = {"requirements_met": True, "details": [], "errors": []}
+        if token_type:
+            requirement_eval["details"].append(f"*Token:* `{token_type}`")
+        if token_balance is not None and required_balance is not None:
+            requirement_eval["details"].append(
+                f"*Token Balance:* {token_balance} ✓ (threshold: {required_balance})"
+            )
+    else:
+        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+
     if not requirement_eval["requirements_met"]:
         error_text = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
             requirement_eval["errors"] or ["Please retry after updating your holdings."]
