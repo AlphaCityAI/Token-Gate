@@ -1,6 +1,7 @@
 import telebot
 import os
 import html as html_module
+import hmac
 import logging
 import json
 import sys
@@ -16,6 +17,7 @@ from psycopg2 import pool
 from logging.handlers import RotatingFileHandler
 from contextlib import contextmanager
 from io import StringIO, BytesIO
+from urllib.parse import urljoin
 import csv
 import functools
 import datetime
@@ -56,6 +58,13 @@ SUI_RPC_URL = os.getenv('SUI_RPC_URL', 'https://fullnode.mainnet.sui.io:443')
 WALLET_CONNECT_URL = os.getenv('WALLET_CONNECT_URL', '').strip()
 PUBLIC_WEBAPP_BASE_URL = os.getenv('PUBLIC_WEBAPP_BASE_URL', '').strip()
 HARDCODED_WALLET_CONNECT_URL = 'https://alphacity.tech/verify'
+# Shared secret for authenticating webhook callbacks from the external verify website.
+# Set WEBHOOK_SECRET in environment variables.  The website must send this value in
+# the X-Webhook-Secret request header when posting to /api/verify.
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '').strip()
+# Allowed origin for CORS on /api/verify.  Defaults to '*' (any origin) which is safe
+# for this credential-free JSON API, but can be restricted to a specific domain.
+CORS_ALLOWED_ORIGIN = os.getenv('CORS_ALLOWED_ORIGIN', '*').strip() or '*'
 
 BOT_NAME = "GuildSafeBot"
 CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
@@ -3718,6 +3727,20 @@ def _send_group_verified_notification(group_id, display_name):
 
 
 # ==================== Flask API Endpoints ========================
+
+def _add_cors_headers(response):
+    """Add CORS headers so the verify page can call /api/verify from any origin.
+
+    The allowed origin is controlled by the CORS_ALLOWED_ORIGIN environment
+    variable (default '*').  This API does not use cookies or credentials so
+    a wildcard origin does not introduce CSRF risk.
+    """
+    response.headers['Access-Control-Allow-Origin'] = CORS_ALLOWED_ORIGIN
+    response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Webhook-Secret'
+    return response
+
+
 @app.route('/')
 def home():
     with config_lock:
@@ -3743,6 +3766,21 @@ def wallet_connect_webapp():
     # JSON-encoded strings for safe embedding in JavaScript literals
     js_group_id = json.dumps(safe_group_id)
     js_tg_user_id = json.dumps(safe_tg_user_id)
+
+    # Build absolute API URL so the page works even when served from a different
+    # domain than the bot (e.g. via CDN / reverse proxy).  Falls back to the
+    # same-origin relative path when no public base URL is configured.
+    public_base = (
+        PUBLIC_WEBAPP_BASE_URL
+        or os.getenv('RENDER_EXTERNAL_URL', '').strip()
+        or os.getenv('PUBLIC_URL', '').strip()
+    )
+    if public_base:
+        # Ensure the base ends with '/' for urljoin to resolve relative to it correctly
+        api_verify_url = urljoin(public_base.rstrip('/') + '/', 'api/verify')
+    else:
+        api_verify_url = "/api/verify"
+    js_api_verify_url = json.dumps(api_verify_url)
 
     html = f"""
 <!doctype html>
@@ -3790,6 +3828,9 @@ def wallet_connect_webapp():
 
     const GROUP_ID = {js_group_id};
     const TG_USER_ID = {js_tg_user_id};
+    // Absolute URL for the bot's verify API – works even when this page is served
+    // from a different domain than the bot (e.g. via CDN / reverse proxy).
+    const API_VERIFY_URL = {js_api_verify_url};
 
     function isValid(addr) {{
       return /^0x[0-9a-fA-F]{{40,64}}$/.test((addr || '').trim());
@@ -3821,7 +3862,7 @@ def wallet_connect_webapp():
       }} else {{
         // External browser (e.g. URL button from group chat): POST to bot API.
         try {{
-          const resp = await fetch('/api/verify', {{
+          const resp = await fetch(API_VERIFY_URL, {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
             body: JSON.stringify(payload)
@@ -3849,7 +3890,7 @@ def wallet_connect_webapp():
     return html
 
 
-@app.route('/api/verify', methods=['POST'])
+@app.route('/api/verify', methods=['POST', 'OPTIONS'])
 def api_verify():
     """REST endpoint for wallet verification submitted from an external browser.
 
@@ -3857,9 +3898,34 @@ def api_verify():
     Telegram WebApp (i.e. the URL-button flow from a group chat).  The endpoint
     validates the wallet, saves it, and sends the confirmation (plus an invite
     link) to the user via the Telegram bot.
+
+    External websites (e.g. alphacity.tech/verify) can also call this endpoint
+    directly from their server or browser after a successful wallet verification,
+    without needing the user to manually run /register in Telegram.  To bypass
+    the on-chain requirement check and trust the website's own verification,
+    include the shared secret in an X-Webhook-Secret request header (set the
+    WEBHOOK_SECRET environment variable on both sides).
     """
+    # Handle CORS preflight so browser-side calls from external domains succeed.
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        return _add_cors_headers(response)
+
     try:
         data = request.get_json(silent=True) or {}
+
+        # Validate webhook secret when provided.  A correct secret tells us the
+        # call came from the trusted external website, so we can skip the
+        # redundant on-chain requirement check (the website already did it).
+        provided_secret = request.headers.get('X-Webhook-Secret', '')
+        webhook_authenticated = (
+            bool(WEBHOOK_SECRET)
+            and bool(provided_secret)
+            and hmac.compare_digest(
+                provided_secret.encode('utf-8'),
+                WEBHOOK_SECRET.encode('utf-8'),
+            )
+        )
 
         wallet_address = (
             data.get('wallet_address') or data.get('walletAddress') or ''
@@ -3876,10 +3942,12 @@ def api_verify():
             tg_user_id = 0
 
         if not is_valid_wallet_address(wallet_address):
-            return jsonify({'success': False, 'error': 'Invalid wallet address'}), 400
+            resp = jsonify({'success': False, 'error': 'Invalid wallet address'})
+            return _add_cors_headers(resp), 400
 
         if not tg_user_id:
-            return jsonify({'success': False, 'error': 'Missing Telegram user ID'}), 400
+            resp = jsonify({'success': False, 'error': 'Missing Telegram user ID'})
+            return _add_cors_headers(resp), 400
 
         # Look up group_id from pending_verifications if not supplied
         if not group_id:
@@ -3890,21 +3958,35 @@ def api_verify():
                 group_id = row[0]
 
         if not group_id:
-            return jsonify({'success': False, 'error': 'No registration context found. Please run /register in the target group first.'}), 400
+            resp = jsonify({'success': False, 'error': 'No registration context found. Please run /register in the target group first.'})
+            return _add_cors_headers(resp), 400
 
         if wallet_already_registered(wallet_address, group_id):
             try:
                 bot.send_message(tg_user_id, "⚠️ This wallet address is already registered for this group.")
             except Exception:
                 pass
-            return jsonify({'success': False, 'error': 'Wallet already registered for this group'}), 409
+            resp = jsonify({'success': False, 'error': 'Wallet already registered for this group'})
+            return _add_cors_headers(resp), 409
 
         with config_lock:
             cfg = SUBSCRIBER_CONFIGS.get(group_id)
         if not cfg:
-            return jsonify({'success': False, 'error': 'Group is not configured. Ask an admin to run /gsconfig first.'}), 400
+            resp = jsonify({'success': False, 'error': 'Group is not configured. Ask an admin to run /gsconfig first.'})
+            return _add_cors_headers(resp), 400
 
-        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
+        # When the call comes from the trusted external website (valid webhook
+        # secret), trust its verification result and skip a redundant RPC check.
+        # Otherwise run the on-chain requirement evaluation ourselves.
+        if webhook_authenticated:
+            requirement_eval = {"requirements_met": True, "details": [], "errors": []}
+            source_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+            logging.info(
+                f"api_verify: webhook callback accepted from {source_ip} for user {tg_user_id}, "
+                f"wallet {wallet_address}, group {group_id}"
+            )
+        else:
+            requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
 
         if not requirement_eval['requirements_met']:
             error_msg = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
@@ -3916,14 +3998,16 @@ def api_verify():
                 bot.send_message(tg_user_id, error_msg, parse_mode='Markdown')
             except Exception:
                 pass
-            return jsonify({'success': False, 'error': 'Wallet does not meet group requirements', 'details': requirement_eval.get('errors', [])}), 403
+            resp = jsonify({'success': False, 'error': 'Wallet does not meet group requirements', 'details': requirement_eval.get('errors', [])})
+            return _add_cors_headers(resp), 403
 
         # Resolve display name (best-effort)
         username = _get_user_display_name(tg_user_id)
 
         success = save_wallet_for_user(group_id, tg_user_id, username, [wallet_address.lower()], replace_existing=False)
         if not success:
-            return jsonify({'success': False, 'error': 'Failed to save wallet. Please try again later.'}), 500
+            resp = jsonify({'success': False, 'error': 'Failed to save wallet. Please try again later.'})
+            return _add_cors_headers(resp), 500
 
         with get_db_cursor() as (conn, cur):
             cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (tg_user_id,))
@@ -3939,11 +4023,13 @@ def api_verify():
         _send_group_verified_notification(group_id, display_name)
 
         logging.info(f"api_verify: wallet {wallet_address} verified for user {tg_user_id} in group {group_id}")
-        return jsonify({'success': True, 'message': 'Wallet verified and registered successfully'})
+        resp = jsonify({'success': True, 'message': 'Wallet verified and registered successfully'})
+        return _add_cors_headers(resp)
 
     except Exception as e:
         logging.error(f"Error in api_verify: {e}")
-        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+        resp = jsonify({'success': False, 'error': 'Internal server error'})
+        return _add_cors_headers(resp), 500
 
 
 @app.route('/health')
