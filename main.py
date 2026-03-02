@@ -3648,30 +3648,17 @@ def handle_wallet_webapp_data(message):
         bot.reply_to(message, "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.")
         return
 
-    # If the mini-app confirmed the requirements on-chain, trust its result and
-    # skip a redundant RPC call.  Otherwise fall back to evaluating directly.
+    # Always perform authoritative server-side verification regardless of what
+    # the client-side mini-app reports.  The mini-app does a client-side check
+    # purely for UX (instant feedback) but the bot must not trust it for access
+    # control since tg.sendData() content is user-controlled.
     if balance_verified:
         logging.info(
-            f"Mini-app confirmed verification for user {user_id}, wallet {wallet_address}: "
+            f"Mini-app reported client-side verification for user {user_id}, wallet {wallet_address}: "
             f"token_type={token_type}, required_balance={required_balance}, "
-            f"token_balance={token_balance}, nft_count={nft_count}"
+            f"token_balance={token_balance}, nft_count={nft_count} — re-verifying server-side"
         )
-        requirement_eval = {"requirements_met": True, "details": [], "errors": []}
-        if token_type:
-            parts = token_type.split('::')
-            symbol = parts[-1] if len(parts) >= 3 else token_type
-            requirement_eval["details"].append(f"*Token:* `{symbol}`")
-        if token_balance is not None and required_balance is not None:
-            requirement_eval["details"].append(
-                f"*Token Balance:* {token_balance:,.2f} ✓ (threshold: {required_balance})" if isinstance(token_balance, (int, float)) else
-                f"*Token Balance:* {token_balance} ✓ (threshold: {required_balance})"
-            )
-        if nft_count is not None:
-            requirement_eval["details"].append(
-                f"*NFTs Owned:* {nft_count} ✓"
-            )
-    else:
-        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+    requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
 
     if not requirement_eval["requirements_met"]:
         error_text = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
@@ -3812,8 +3799,11 @@ def wallet_connect_webapp():
 
     # Extract requirement params passed by build_wallet_connect_url().
     raw_sui_rpc = request.args.get('sui_rpc', SUI_RPC_URL)
-    # Validate the SUI RPC URL to ensure it's a proper URL.
-    if not re.match(r'^https?://', raw_sui_rpc):
+    # Only allow HTTPS URLs for the client-side RPC endpoint.  The client-side
+    # check is purely for UX (instant feedback) — the server always re-verifies
+    # via its own trusted SUI_RPC_URL, so a tampered client RPC cannot bypass
+    # access control.
+    if not re.match(r'^https://', raw_sui_rpc):
         raw_sui_rpc = SUI_RPC_URL
     js_sui_rpc = json.dumps(raw_sui_rpc)
 
@@ -3834,7 +3824,11 @@ def wallet_connect_webapp():
     js_reg_mode = json.dumps(safe_reg_mode)
 
     raw_nft_collection = request.args.get('nft_collection_id', '')
-    safe_nft_collection = re.sub(r'[^0-9a-fA-Fx]', '', raw_nft_collection)
+    # SUI addresses are 0x followed by hex digits only.
+    nft_hex = raw_nft_collection[2:] if raw_nft_collection.startswith('0x') else raw_nft_collection
+    safe_nft_collection = re.sub(r'[^0-9a-fA-F]', '', nft_hex)
+    if safe_nft_collection:
+        safe_nft_collection = '0x' + safe_nft_collection
     js_nft_collection = json.dumps(safe_nft_collection)
 
     raw_nft_threshold = request.args.get('nft_threshold', '1')
@@ -4201,8 +4195,9 @@ def wallet_connect_webapp():
         $wallet.dispatchEvent(new Event('input'));
       }}
     }} catch (_) {{
-      // Clipboard API not available in this context — ignore silently.
-      $pasteBtn.textContent = 'N/A';
+      // Clipboard API not available — show hint instead of silently failing.
+      $pasteBtn.textContent = '⌨️ Type';
+      $pasteBtn.title = 'Clipboard not available — please type your address manually';
       $pasteBtn.disabled = true;
     }}
   }});
@@ -4252,7 +4247,11 @@ def wallet_connect_webapp():
       try {{
         const bal = await suiRpc('suix_getBalance', [wallet, TOKEN_TYPE]);
         const raw = BigInt(bal.totalBalance || '0');
-        result.tokenBalance = Number(raw) / Math.pow(10, DECIMALS);
+        const divisor = BigInt(Math.pow(10, DECIMALS));
+        // Integer part via BigInt; fractional part via remainder to avoid precision loss.
+        const intPart = Number(raw / divisor);
+        const fracPart = Number(raw % divisor) / Number(divisor);
+        result.tokenBalance = intPart + fracPart;
         result.tokenOk = result.tokenBalance >= MIN_HOLDING;
       }} catch (e) {{
         // RPC failure: let the bot do server-side verification as fallback.
@@ -4277,12 +4276,11 @@ def wallet_connect_webapp():
           for (const item of items) {{
             const obj = item.data || {{}};
             const objType = (obj.type || '').toLowerCase();
-            const objId = (obj.objectId || '').toLowerCase();
             if (!objType || objType.indexOf('::') === -1) continue;
             if (objType.indexOf('coin::') !== -1) continue;
-            // Match by collection ID prefix in objectId or type string
+            // Match: type string starts with the collection package ID (e.g. "0xabc123::module::Type")
             const collLower = NFT_COLLECTION.toLowerCase();
-            if (objId.indexOf(collLower) !== -1 || objType.indexOf(collLower) !== -1) {{
+            if (objType.startsWith(collLower + '::') || objType === collLower) {{
               count++;
             }}
           }}
