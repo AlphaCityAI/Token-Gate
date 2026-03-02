@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: token-gate-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    # Render exposes the PORT env var; main.py already reads it (default 5000).
+    # The public URL is available as RENDER_EXTERNAL_URL, which main.py uses
+    # to build the /verify WebApp URL when WALLET_CONNECT_URL is not set.
+    envVars:
+      # ── Required ───────────────────────────────────────────────────────────
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false          # Set this secret in the Render dashboard
+      - key: DATABASE_URL
+        sync: false          # Set this secret in the Render dashboard
+      # ── Optional / recommended ─────────────────────────────────────────────
+      # Leave WALLET_CONNECT_URL empty so the bot serves /verify from its own URL.
+      - key: WALLET_CONNECT_URL
+        value: ""
+      # RENDER_EXTERNAL_URL is injected automatically by Render.
+      # PUBLIC_WEBAPP_BASE_URL is only needed if you want to override it.
+      - key: PUBLIC_WEBAPP_BASE_URL
+        value: ""
+      # Shared secret used to authenticate webhook callbacks to /api/verify.
+      - key: WEBHOOK_SECRET
+        sync: false
+      # CORS origin for /api/verify. "*" is safe (credential-free API).
+      - key: CORS_ALLOWED_ORIGIN
+        value: "*"
+      # Sui RPC endpoint (defaults to Mysten mainnet).
+      - key: SUI_RPC_URL
+        value: https://fullnode.mainnet.sui.io:443
+      # Database connection pool size (tune to your Render plan).
+      - key: DB_POOL_MIN
+        value: "2"
+      - key: DB_POOL_MAX
+        value: "10"
