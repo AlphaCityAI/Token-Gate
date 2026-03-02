@@ -4290,7 +4290,7 @@ def wallet_connect_webapp():
           // Only include wallets that support the SUI chain
           const chains = w.chains || [];
           const hasSui = chains.some(function(c) {{ return c.startsWith('sui:'); }});
-          if (hasSui || chains.length === 0) {{
+          if (hasSui) {{
             found.push(w);
           }}
         }}
