@@ -17,7 +17,7 @@ from psycopg2 import pool
 from logging.handlers import RotatingFileHandler
 from contextlib import contextmanager
 from io import StringIO, BytesIO
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 import csv
 import functools
 import datetime
@@ -3141,7 +3141,7 @@ def handle_start(message):
                 markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
                 bot.reply_to(
                     message,
-                    "🔐 *Wallet Registration*\n\nTap **Verify Wallet** to connect your Sui wallet and verify your token/NFT holdings for this group.",
+                    "🔐 *Wallet Registration*\n\nTap **Verify Wallet** to open the mini-app and verify your SUI wallet.\nYour holdings will be checked on-chain — all within Telegram!",
                     reply_markup=markup,
                     parse_mode="Markdown"
                 )
@@ -3312,30 +3312,39 @@ def confirm_verification(message):
             pass
 
 def build_wallet_connect_url(group_id, user_id, cfg=None):
-    """Build a verification URL compatible with external wallet pages and Telegram WebApp.
+    """Build a verification URL for the built-in Telegram mini-app.
+
+    Always prefers the bot's own ``/verify`` endpoint so that verification
+    happens entirely inside the Telegram mini-app without leaving to an
+    external website.
 
     When *cfg* is provided the group's token/NFT requirements are appended as
     query parameters so the verify page knows what to check:
       - token_type        : fully-qualified token type string (e.g. 0x...::city::CITY)
       - required_balance  : minimum holding expressed in the token's smallest unit
+      - decimals          : token decimal places (for display formatting)
+      - minimum_holding   : human-readable minimum (e.g. 5000)
       - registration_mode : "token", "nft", or "both"
       - nft_collection_id : NFT collection object ID (when applicable)
+      - nft_threshold     : minimum NFT count required
+      - sui_rpc           : SUI RPC endpoint for client-side on-chain queries
     """
-    base_url = globals().get("WALLET_CONNECT_URL")
-    if base_url is None:
-        base_url = os.getenv('WALLET_CONNECT_URL', '').strip()
-
-    # Prefer explicit config. Otherwise build from known public base URL envs.
-    if not base_url:
-        public_base = PUBLIC_WEBAPP_BASE_URL or os.getenv('RENDER_EXTERNAL_URL', '').strip() or os.getenv('PUBLIC_URL', '').strip()
-        if public_base:
-            base_url = f"{public_base.rstrip('/')}/verify"
-
-    if not base_url:
-        base_url = HARDCODED_WALLET_CONNECT_URL
+    # Always prefer the bot's own /verify endpoint for the mini-app experience.
+    # Fall back to WALLET_CONNECT_URL / hardcoded URL only as a last resort.
+    public_base = (
+        PUBLIC_WEBAPP_BASE_URL
+        or os.getenv('RENDER_EXTERNAL_URL', '').strip()
+        or os.getenv('PUBLIC_URL', '').strip()
+    )
+    if public_base:
+        base_url = f"{public_base.rstrip('/')}/verify"
+    else:
+        base_url = globals().get("WALLET_CONNECT_URL") or os.getenv('WALLET_CONNECT_URL', '').strip()
+        if not base_url:
+            base_url = HARDCODED_WALLET_CONNECT_URL
 
     separator = '&' if '?' in base_url else '?'
-    # Include both snake_case and camelCase query keys for compatibility with external pages.
+    # Include both snake_case and camelCase query keys for compatibility.
     url = (
         f"{base_url}{separator}group_id={group_id}"
         f"&tg_user_id={user_id}"
@@ -3343,23 +3352,30 @@ def build_wallet_connect_url(group_id, user_id, cfg=None):
         f"&tgUserId={user_id}"
     )
 
+    # Append SUI RPC URL so the mini-app can do client-side on-chain verification.
+    url += f"&sui_rpc={quote(SUI_RPC_URL, safe='')}"
+
     if cfg:
         token = cfg.get("token", "")
         minimum_holding = cfg.get("minimum_holding", 0)
         decimals = cfg.get("decimals", 6)
         registration_mode = cfg.get("registration_mode", "token")
         nft_collection_id = cfg.get("nft_collection_id", "")
+        nft_threshold = cfg.get("nft_threshold", 1)
 
         if token:
-            url += f"&token_type={token}"
+            url += f"&token_type={quote(token, safe='')}"
             required_balance = int(round(minimum_holding * (10 ** decimals)))
             url += f"&required_balance={required_balance}"
+            url += f"&decimals={decimals}"
+            url += f"&minimum_holding={minimum_holding}"
 
         if registration_mode:
             url += f"&registration_mode={registration_mode}"
 
         if nft_collection_id:
-            url += f"&nft_collection_id={nft_collection_id}"
+            url += f"&nft_collection_id={quote(nft_collection_id, safe='')}"
+            url += f"&nft_threshold={nft_threshold}"
 
     return url
 
@@ -3400,22 +3416,33 @@ def register_wallets(message):
 
         with config_lock:
             group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
-        connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
-        webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
         markup = types.InlineKeyboardMarkup()
 
         if is_private:
-            # Telegram supports WebApp buttons in private chats.
+            # Telegram supports WebApp buttons in private chats – open the
+            # built-in mini-app directly so the user never leaves Telegram.
+            connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
+            webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
             markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
         else:
-            # In group chats, WebApp button type may be rejected (BUTTON_TYPE_INVALID), so use URL button.
-            markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=webapp_url))
+            # In group chats, WebApp buttons are not supported. Use a deep-link
+            # to the bot's private chat which will show the WebApp button there,
+            # keeping the entire flow inside Telegram.
+            try:
+                bot_username = bot.get_me().username
+                deep_link = f"https://t.me/{bot_username}?start=register_{group_id}"
+                markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=deep_link))
+            except Exception:
+                # Fallback: direct URL (only if deep-link fails)
+                connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
+                webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
+                markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=webapp_url))
 
         message_thread_id = getattr(message, 'message_thread_id', None)
         register_text = (
             "🔐 **Wallet Registration**\n\n"
-            "Tap **Verify Wallet** to open your wallet and sign in.\n"
-            "After successful sign-in, your wallet will be verified on-chain automatically."
+            "Tap **Verify Wallet** to open the mini-app and verify your SUI wallet.\n"
+            "Your token/NFT holdings will be checked on-chain automatically — all within Telegram!"
         )
 
         if message_thread_id:
@@ -3577,15 +3604,17 @@ def handle_wallet_webapp_data(message):
     )
 
     # Extract verification result fields sent by the verify page.
-    # The verify page sends these after completing an on-chain balance check.
-    # Note: payload arrives via the Telegram WebApp channel (tg.sendData), which
-    # is the same trust level as the wallet_address already accepted above.
+    # The mini-app performs on-chain balance/NFT checks client-side and sends
+    # the results here via tg.sendData().
     balance_verified = payload.get('balance_verified')
     if balance_verified is None:
         balance_verified = (payload.get('data') or {}).get('balance_verified')
     token_type = payload.get('token_type') or (payload.get('data') or {}).get('token_type') or ''
     required_balance = payload.get('required_balance') or (payload.get('data') or {}).get('required_balance')
     token_balance = payload.get('token_balance') or (payload.get('data') or {}).get('token_balance')
+    nft_count = payload.get('nft_count')
+    if nft_count is None:
+        nft_count = (payload.get('data') or {}).get('nft_count')
 
     if not is_valid_wallet_address(wallet_address):
         bot.reply_to(message, "❌ Wallet verification failed: invalid wallet payload from WebApp.")
@@ -3619,19 +3648,27 @@ def handle_wallet_webapp_data(message):
         bot.reply_to(message, "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.")
         return
 
-    # If the verify page confirmed the balance on-chain, trust its result and skip a redundant
-    # RPC call. Otherwise fall back to evaluating requirements directly from the bot.
+    # If the mini-app confirmed the requirements on-chain, trust its result and
+    # skip a redundant RPC call.  Otherwise fall back to evaluating directly.
     if balance_verified:
         logging.info(
-            f"Verify page confirmed balance for user {user_id}, wallet {wallet_address}: "
-            f"token_type={token_type}, required_balance={required_balance}, token_balance={token_balance}"
+            f"Mini-app confirmed verification for user {user_id}, wallet {wallet_address}: "
+            f"token_type={token_type}, required_balance={required_balance}, "
+            f"token_balance={token_balance}, nft_count={nft_count}"
         )
         requirement_eval = {"requirements_met": True, "details": [], "errors": []}
         if token_type:
-            requirement_eval["details"].append(f"*Token:* `{token_type}`")
+            parts = token_type.split('::')
+            symbol = parts[-1] if len(parts) >= 3 else token_type
+            requirement_eval["details"].append(f"*Token:* `{symbol}`")
         if token_balance is not None and required_balance is not None:
             requirement_eval["details"].append(
+                f"*Token Balance:* {token_balance:,.2f} ✓ (threshold: {required_balance})" if isinstance(token_balance, (int, float)) else
                 f"*Token Balance:* {token_balance} ✓ (threshold: {required_balance})"
+            )
+        if nft_count is not None:
+            requirement_eval["details"].append(
+                f"*NFTs Owned:* {nft_count} ✓"
             )
     else:
         requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
@@ -3753,140 +3790,639 @@ def home():
 @app.route('/wallet-connect')
 @app.route('/verify')
 def wallet_connect_webapp():
-    """Telegram WebApp / external-browser page for wallet verification."""
+    """Telegram mini-app for wallet verification.
+
+    This page is designed to run entirely inside a Telegram WebApp so that
+    users never need to leave Telegram to verify their SUI wallet.  It
+    performs on-chain balance/NFT checks directly via the SUI JSON-RPC from
+    the client side and sends the verified result back to the bot via
+    ``tg.sendData()``.  An external-browser fallback (POST to /api/verify)
+    is kept for edge cases.
+    """
     group_id = request.args.get('group_id', '') or request.args.get('groupId', '')
     tg_user_id = request.args.get('tg_user_id', '') or request.args.get('tgUserId', '')
 
     # Sanitize to digits-only to prevent XSS – these are numeric IDs.
     safe_group_id = re.sub(r'[^0-9\-]', '', group_id)
     safe_tg_user_id = re.sub(r'[^0-9\-]', '', tg_user_id)
-    # HTML-escaped versions for the visible hint text
-    hint_group = html_module.escape(safe_group_id)
-    hint_user = html_module.escape(safe_tg_user_id)
-    # JSON-encoded strings for safe embedding in JavaScript literals
+
+    # JSON-encoded strings for safe embedding in JavaScript literals.
     js_group_id = json.dumps(safe_group_id)
     js_tg_user_id = json.dumps(safe_tg_user_id)
 
-    # Build absolute API URL so the page works even when served from a different
-    # domain than the bot (e.g. via CDN / reverse proxy).  Falls back to the
-    # same-origin relative path when no public base URL is configured.
+    # Extract requirement params passed by build_wallet_connect_url().
+    raw_sui_rpc = request.args.get('sui_rpc', SUI_RPC_URL)
+    # Validate the SUI RPC URL to ensure it's a proper URL.
+    if not re.match(r'^https?://', raw_sui_rpc):
+        raw_sui_rpc = SUI_RPC_URL
+    js_sui_rpc = json.dumps(raw_sui_rpc)
+
+    raw_token_type = request.args.get('token_type', '')
+    # Sanitize token_type: allow hex, colons, and alphanumeric (SUI type format).
+    safe_token_type = re.sub(r'[^0-9a-zA-Z:_]', '', raw_token_type)
+    js_token_type = json.dumps(safe_token_type)
+
+    raw_required_balance = request.args.get('required_balance', '0')
+    safe_required_balance = re.sub(r'[^0-9]', '', raw_required_balance) or '0'
+    raw_decimals = request.args.get('decimals', '6')
+    safe_decimals = re.sub(r'[^0-9]', '', raw_decimals) or '6'
+    raw_minimum_holding = request.args.get('minimum_holding', '0')
+    safe_minimum_holding = re.sub(r'[^0-9.]', '', raw_minimum_holding) or '0'
+
+    raw_reg_mode = request.args.get('registration_mode', 'token')
+    safe_reg_mode = re.sub(r'[^a-z]', '', raw_reg_mode) or 'token'
+    js_reg_mode = json.dumps(safe_reg_mode)
+
+    raw_nft_collection = request.args.get('nft_collection_id', '')
+    safe_nft_collection = re.sub(r'[^0-9a-fA-Fx]', '', raw_nft_collection)
+    js_nft_collection = json.dumps(safe_nft_collection)
+
+    raw_nft_threshold = request.args.get('nft_threshold', '1')
+    safe_nft_threshold = re.sub(r'[^0-9]', '', raw_nft_threshold) or '1'
+
+    # Build absolute API URL for the external-browser fallback path.
     public_base = (
         PUBLIC_WEBAPP_BASE_URL
         or os.getenv('RENDER_EXTERNAL_URL', '').strip()
         or os.getenv('PUBLIC_URL', '').strip()
     )
     if public_base:
-        # Ensure the base ends with '/' for urljoin to resolve relative to it correctly
         api_verify_url = urljoin(public_base.rstrip('/') + '/', 'api/verify')
     else:
         api_verify_url = "/api/verify"
     js_api_verify_url = json.dumps(api_verify_url)
 
-    html = f"""
-<!doctype html>
+    html = f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>GuildSafe Wallet Verify</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>GuildSafe — Verify Wallet</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
-    body {{ font-family: Arial, sans-serif; padding: 16px; background: #0f172a; color: #e2e8f0; margin: 0; }}
-    .card {{ max-width: 480px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 20px; }}
-    h3 {{ margin-top: 0; }}
-    input {{ width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #475569; background: #0b1220; color: #e2e8f0; box-sizing: border-box; font-size: 14px; }}
-    button {{ margin-top: 12px; width: 100%; padding: 12px; border: 0; border-radius: 8px; background: #22c55e; color: #052e16; font-weight: 700; font-size: 15px; cursor: pointer; }}
-    button:disabled {{ opacity: 0.55; cursor: not-allowed; }}
-    .hint {{ color: #94a3b8; font-size: 12px; margin-top: 8px; }}
-    .row {{ display: grid; gap: 8px; }}
-    .status {{ margin-top: 14px; padding: 12px; border-radius: 8px; font-size: 14px; display: none; }}
-    .status.success {{ background: #14532d; color: #86efac; display: block; }}
-    .status.error {{ background: #450a0a; color: #fca5a5; display: block; }}
-    .label {{ font-size: 13px; color: #94a3b8; margin-bottom: 4px; }}
+    :root {{
+      --bg: #0f172a; --card: #1e293b; --card2: #162032;
+      --border: #334155; --text: #e2e8f0; --muted: #94a3b8;
+      --green: #22c55e; --green-bg: #14532d; --green-text: #86efac;
+      --red: #ef4444; --red-bg: #450a0a; --red-text: #fca5a5;
+      --blue: #3b82f6; --blue-bg: #1e3a5f;
+      --radius: 12px;
+    }}
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh; padding: 0;
+    }}
+    .app {{ max-width: 480px; margin: 0 auto; padding: 16px 16px 32px; }}
+
+    /* ── Header ── */
+    .header {{
+      text-align: center; padding: 20px 0 8px;
+    }}
+    .header .logo {{ font-size: 40px; margin-bottom: 4px; }}
+    .header h1 {{ font-size: 20px; font-weight: 700; margin: 0; }}
+    .header .subtitle {{ color: var(--muted); font-size: 13px; margin-top: 4px; }}
+
+    /* ── Steps indicator ── */
+    .steps {{
+      display: flex; justify-content: center; gap: 8px; margin: 18px 0 20px;
+    }}
+    .step {{
+      display: flex; align-items: center; gap: 6px;
+      font-size: 12px; color: var(--muted); font-weight: 600;
+    }}
+    .step .dot {{
+      width: 28px; height: 28px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700;
+      background: var(--card); border: 2px solid var(--border);
+      transition: all .3s;
+    }}
+    .step.active .dot {{ background: var(--blue); border-color: var(--blue); color: #fff; }}
+    .step.done .dot {{ background: var(--green); border-color: var(--green); color: #fff; }}
+    .step-line {{
+      width: 32px; height: 2px; background: var(--border); align-self: center;
+      border-radius: 1px; transition: background .3s;
+    }}
+    .step-line.done {{ background: var(--green); }}
+
+    /* ── Card ── */
+    .card {{
+      background: var(--card); border-radius: var(--radius);
+      padding: 20px; margin-bottom: 14px;
+      border: 1px solid var(--border);
+    }}
+    .card h2 {{ font-size: 16px; margin-bottom: 12px; }}
+
+    /* ── Requirements panel ── */
+    .req-item {{
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; background: var(--card2); border-radius: 8px;
+      margin-bottom: 8px; font-size: 13px;
+    }}
+    .req-item .icon {{ font-size: 18px; flex-shrink: 0; }}
+    .req-item .label {{ color: var(--muted); font-size: 11px; }}
+    .req-item .value {{ font-weight: 600; }}
+
+    /* ── Wallet input ── */
+    .input-group {{
+      position: relative;
+    }}
+    .input-group input {{
+      width: 100%; padding: 14px 52px 14px 14px;
+      border-radius: 10px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text);
+      font-size: 14px; font-family: 'SF Mono', 'Fira Code', monospace;
+      outline: none; transition: border-color .2s;
+    }}
+    .input-group input:focus {{ border-color: var(--blue); }}
+    .input-group input::placeholder {{ color: #475569; }}
+    .paste-btn {{
+      position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+      background: var(--card); border: 1px solid var(--border);
+      color: var(--muted); border-radius: 6px; padding: 6px 10px;
+      font-size: 12px; cursor: pointer; font-weight: 600;
+      transition: all .2s;
+    }}
+    .paste-btn:hover {{ color: var(--text); border-color: var(--text); }}
+    .input-hint {{
+      font-size: 11px; color: var(--muted); margin-top: 6px; padding-left: 2px;
+    }}
+    .input-valid {{ color: var(--green) !important; }}
+    .input-invalid {{ color: var(--red) !important; }}
+
+    /* ── Primary button ── */
+    .btn {{
+      width: 100%; padding: 14px; border: 0; border-radius: 10px;
+      font-weight: 700; font-size: 15px; cursor: pointer;
+      transition: all .2s; margin-top: 14px;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+    }}
+    .btn-primary {{ background: var(--green); color: #052e16; }}
+    .btn-primary:hover {{ filter: brightness(1.1); }}
+    .btn:disabled {{ opacity: 0.5; cursor: not-allowed; filter: none; }}
+
+    /* ── Status / result ── */
+    .result-card {{
+      text-align: center; padding: 24px 20px;
+    }}
+    .result-card .result-icon {{ font-size: 48px; margin-bottom: 12px; }}
+    .result-card h2 {{ margin-bottom: 8px; }}
+    .result-card p {{ color: var(--muted); font-size: 13px; line-height: 1.5; }}
+
+    .detail-row {{
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 0; font-size: 13px;
+      border-bottom: 1px solid var(--border);
+    }}
+    .detail-row:last-child {{ border-bottom: none; }}
+    .detail-row .dt {{ color: var(--muted); }}
+    .detail-row .dd {{ font-weight: 600; }}
+    .pass {{ color: var(--green); }}
+    .fail {{ color: var(--red); }}
+
+    /* ── Spinner ── */
+    .spinner {{
+      width: 18px; height: 18px; border: 2px solid rgba(255,255,255,.3);
+      border-top-color: #fff; border-radius: 50%;
+      animation: spin .6s linear infinite; display: inline-block;
+    }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
+    /* ── Progress bar ── */
+    .progress-bar {{
+      width: 100%; height: 4px; background: var(--border);
+      border-radius: 2px; margin-top: 14px; overflow: hidden;
+    }}
+    .progress-bar .fill {{
+      height: 100%; background: var(--green); border-radius: 2px;
+      transition: width .4s ease; width: 0%;
+    }}
+
+    /* ── Alerts ── */
+    .alert {{
+      padding: 12px 14px; border-radius: 8px; font-size: 13px;
+      margin-top: 12px; line-height: 1.5; display: none;
+    }}
+    .alert.show {{ display: block; }}
+    .alert-error {{ background: var(--red-bg); color: var(--red-text); }}
+    .alert-success {{ background: var(--green-bg); color: var(--green-text); }}
+    .alert-info {{ background: var(--blue-bg); color: #93c5fd; }}
+
+    /* ── Sections ── */
+    .section {{ display: none; }}
+    .section.active {{ display: block; }}
+
+    /* ── Fade-in animation ── */
+    @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: none; }} }}
+    .section.active {{ animation: fadeIn .3s ease; }}
   </style>
 </head>
 <body>
-  <div class="card">
-    <h3>🔐 Verify Wallet</h3>
-    <p>Enter your Sui wallet address to verify token/NFT holdings for this group.</p>
-    <div class="row">
-      <div>
-        <div class="label">Wallet Address (any Sui wallet)</div>
-        <input id="wallet" placeholder="0x..." autocomplete="off" spellcheck="false" />
-      </div>
-      <button id="submitBtn">Submit Wallet</button>
-    </div>
-    <p class="hint">Group: {hint_group} · User: {hint_user}</p>
-    <div id="status" class="status"></div>
+<div class="app">
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">🔐</div>
+    <h1>Wallet Verification</h1>
+    <div class="subtitle">Verify your SUI wallet — right here in Telegram</div>
   </div>
-  <script>
-    const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
-    // isWebApp is true only when genuinely running inside a Telegram WebApp context
-    // (tg.initData is non-empty only in that case).
-    const isWebApp = !!(tg && tg.initData && tg.initData.length > 0);
-    if (tg) tg.ready();
 
-    const GROUP_ID = {js_group_id};
-    const TG_USER_ID = {js_tg_user_id};
-    // Absolute URL for the bot's verify API – works even when this page is served
-    // from a different domain than the bot (e.g. via CDN / reverse proxy).
-    const API_VERIFY_URL = {js_api_verify_url};
+  <!-- Step indicators -->
+  <div class="steps">
+    <div class="step active" id="step1">
+      <div class="dot">1</div>
+      <span>Wallet</span>
+    </div>
+    <div class="step-line" id="line1"></div>
+    <div class="step" id="step2">
+      <div class="dot">2</div>
+      <span>Verify</span>
+    </div>
+    <div class="step-line" id="line2"></div>
+    <div class="step" id="step3">
+      <div class="dot">3</div>
+      <span>Done</span>
+    </div>
+  </div>
 
-    function isValid(addr) {{
-      return /^0x[0-9a-fA-F]{{40,64}}$/.test((addr || '').trim());
+  <!-- ▸ SECTION 1: Enter wallet -->
+  <div class="section active" id="sec-wallet">
+    <!-- Requirements info -->
+    <div class="card" id="reqCard">
+      <h2>📋 Requirements</h2>
+      <div id="reqList"></div>
+    </div>
+
+    <div class="card">
+      <h2>Enter SUI Wallet Address</h2>
+      <div class="input-group">
+        <input id="wallet" type="text" placeholder="0x..." autocomplete="off"
+               spellcheck="false" autocapitalize="none" />
+        <button class="paste-btn" id="pasteBtn">📋 Paste</button>
+      </div>
+      <div class="input-hint" id="inputHint">Paste or type your SUI wallet address (0x...)</div>
+      <button class="btn btn-primary" id="verifyBtn" disabled>
+        Verify On-Chain
+      </button>
+      <div class="alert" id="walletAlert"></div>
+    </div>
+  </div>
+
+  <!-- ▸ SECTION 2: Verifying -->
+  <div class="section" id="sec-verifying">
+    <div class="card" style="text-align:center; padding:32px 20px;">
+      <div style="font-size:40px; margin-bottom:12px;">🔍</div>
+      <h2>Verifying On-Chain…</h2>
+      <p style="color:var(--muted); font-size:13px; margin-top:8px;" id="verifyStatus">
+        Querying SUI blockchain for your holdings…
+      </p>
+      <div class="progress-bar"><div class="fill" id="progressFill"></div></div>
+    </div>
+  </div>
+
+  <!-- ▸ SECTION 3: Result -->
+  <div class="section" id="sec-result">
+    <div class="card result-card" id="resultCard"></div>
+    <div class="card" id="detailsCard" style="display:none;">
+      <h2>📊 Verification Details</h2>
+      <div id="detailRows"></div>
+    </div>
+    <div class="alert" id="resultAlert"></div>
+  </div>
+</div>
+
+<script>
+(function() {{
+  'use strict';
+
+  /* ── Telegram WebApp integration ── */
+  const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  const isWebApp = !!(tg && tg.initData && tg.initData.length > 0);
+  if (tg) {{
+    tg.ready();
+    tg.expand();
+    // Apply Telegram theme colours when available.
+    const tp = tg.themeParams || {{}};
+    if (tp.bg_color) document.documentElement.style.setProperty('--bg', tp.bg_color);
+    if (tp.secondary_bg_color) document.documentElement.style.setProperty('--card', tp.secondary_bg_color);
+    if (tp.text_color) document.documentElement.style.setProperty('--text', tp.text_color);
+    if (tp.hint_color) document.documentElement.style.setProperty('--muted', tp.hint_color);
+    if (tp.button_color) document.documentElement.style.setProperty('--blue', tp.button_color);
+    if (tp.button_color) document.documentElement.style.setProperty('--green', tp.button_color);
+  }}
+
+  /* ── Configuration from query params (server-injected) ── */
+  const GROUP_ID        = {js_group_id};
+  const TG_USER_ID      = {js_tg_user_id};
+  const SUI_RPC         = {js_sui_rpc};
+  const TOKEN_TYPE      = {js_token_type};
+  const REQUIRED_BAL    = {safe_required_balance};
+  const DECIMALS        = {safe_decimals};
+  const MIN_HOLDING     = {safe_minimum_holding};
+  const REG_MODE        = {js_reg_mode};
+  const NFT_COLLECTION  = {js_nft_collection};
+  const NFT_THRESHOLD   = {safe_nft_threshold};
+  const API_VERIFY_URL  = {js_api_verify_url};
+
+  /* ── DOM refs ── */
+  const $wallet    = document.getElementById('wallet');
+  const $pasteBtn  = document.getElementById('pasteBtn');
+  const $verifyBtn = document.getElementById('verifyBtn');
+  const $hint      = document.getElementById('inputHint');
+  const $walletAlert = document.getElementById('walletAlert');
+
+  /* ── Render requirements panel ── */
+  (function renderReqs() {{
+    const $list = document.getElementById('reqList');
+    const items = [];
+    if ((REG_MODE === 'token' || REG_MODE === 'both') && TOKEN_TYPE) {{
+      // Show a human-friendly token name extracted from the fully-qualified type.
+      const parts = TOKEN_TYPE.split('::');
+      const symbol = parts.length >= 3 ? parts[parts.length - 1] : TOKEN_TYPE;
+      items.push({{
+        icon: '💰', label: 'Minimum Token Balance',
+        value: Number(MIN_HOLDING).toLocaleString() + ' ' + symbol
+      }});
     }}
-
-    function showStatus(msg, type) {{
-      const el = document.getElementById('status');
-      el.textContent = msg;
-      el.className = 'status ' + type;
+    if ((REG_MODE === 'nft' || REG_MODE === 'both') && NFT_COLLECTION) {{
+      items.push({{
+        icon: '🖼️', label: 'NFT Ownership',
+        value: NFT_THRESHOLD + '+ NFT' + (NFT_THRESHOLD > 1 ? 's' : '') + ' required'
+      }});
     }}
-
-    document.getElementById('submitBtn').addEventListener('click', async () => {{
-      const wallet = document.getElementById('wallet').value.trim();
-      if (!isValid(wallet)) {{
-        showStatus('Invalid wallet format. Please enter a valid Sui 0x address.', 'error');
-        return;
-      }}
-
-      const btn = document.getElementById('submitBtn');
-      btn.disabled = true;
-      btn.textContent = 'Verifying…';
-
-      const payload = {{ wallet_address: wallet, group_id: GROUP_ID, tg_user_id: TG_USER_ID }};
-
-      if (isWebApp) {{
-        // Inside Telegram WebApp: send data back via Telegram API, then close.
-        tg.sendData(JSON.stringify(payload));
-        tg.close();
-      }} else {{
-        // External browser (e.g. URL button from group chat): POST to bot API.
-        try {{
-          const resp = await fetch(API_VERIFY_URL, {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify(payload)
-          }});
-          const result = await resp.json();
-          if (result.success) {{
-            showStatus('✅ Wallet verified! Check your Telegram for a confirmation message and group invite link.', 'success');
-            btn.textContent = 'Verified!';
-          }} else {{
-            showStatus('❌ ' + (result.error || 'Verification failed. Please try again.'), 'error');
-            btn.disabled = false;
-            btn.textContent = 'Submit Wallet';
-          }}
-        }} catch (e) {{
-          showStatus('❌ Network error. Please check your connection and try again.', 'error');
-          btn.disabled = false;
-          btn.textContent = 'Submit Wallet';
-        }}
-      }}
+    if (REG_MODE === 'both' && items.length === 2) {{
+      const note = document.createElement('div');
+      note.className = 'req-item';
+      note.innerHTML = '<span class="icon">ℹ️</span><div><div class="label">Mode</div><div class="value">Meet either token OR NFT requirement</div></div>';
+      items.push({{ _el: note }});
+    }}
+    if (items.length === 0) {{
+      document.getElementById('reqCard').style.display = 'none';
+      return;
+    }}
+    items.forEach(function(it) {{
+      if (it._el) {{ $list.appendChild(it._el); return; }}
+      const el = document.createElement('div');
+      el.className = 'req-item';
+      el.innerHTML = '<span class="icon">' + it.icon + '</span><div><div class="label">' + it.label + '</div><div class="value">' + it.value + '</div></div>';
+      $list.appendChild(el);
     }});
-  </script>
+  }})();
+
+  /* ── Wallet address validation ── */
+  function isValidSuiAddress(addr) {{
+    return /^0x[0-9a-fA-F]{{40,64}}$/.test((addr || '').trim());
+  }}
+
+  $wallet.addEventListener('input', function() {{
+    const v = $wallet.value.trim();
+    if (!v) {{
+      $hint.textContent = 'Paste or type your SUI wallet address (0x…)';
+      $hint.className = 'input-hint';
+      $verifyBtn.disabled = true;
+    }} else if (isValidSuiAddress(v)) {{
+      $hint.textContent = '✓ Valid SUI address';
+      $hint.className = 'input-hint input-valid';
+      $verifyBtn.disabled = false;
+    }} else {{
+      $hint.textContent = '✗ Invalid format — must be 0x followed by 40-64 hex characters';
+      $hint.className = 'input-hint input-invalid';
+      $verifyBtn.disabled = true;
+    }}
+  }});
+
+  /* ── Paste button ── */
+  $pasteBtn.addEventListener('click', async function() {{
+    try {{
+      const text = await navigator.clipboard.readText();
+      if (text) {{
+        $wallet.value = text.trim();
+        $wallet.dispatchEvent(new Event('input'));
+      }}
+    }} catch (_) {{
+      // Clipboard API not available in this context — ignore silently.
+      $pasteBtn.textContent = 'N/A';
+      $pasteBtn.disabled = true;
+    }}
+  }});
+
+  /* ── Section / step management ── */
+  function goToSection(n) {{
+    ['sec-wallet', 'sec-verifying', 'sec-result'].forEach(function(id, i) {{
+      const el = document.getElementById(id);
+      if (i + 1 === n) el.classList.add('active');
+      else el.classList.remove('active');
+    }});
+    for (let i = 1; i <= 3; i++) {{
+      const s = document.getElementById('step' + i);
+      s.classList.remove('active', 'done');
+      if (i < n) s.classList.add('done');
+      else if (i === n) s.classList.add('active');
+    }}
+    for (let i = 1; i <= 2; i++) {{
+      const l = document.getElementById('line' + i);
+      if (i < n) l.classList.add('done');
+      else l.classList.remove('done');
+    }}
+  }}
+
+  /* ── SUI RPC helper ── */
+  async function suiRpc(method, params) {{
+    const resp = await fetch(SUI_RPC, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ jsonrpc: '2.0', id: 1, method: method, params: params }})
+    }});
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message || 'RPC error');
+    return data.result;
+  }}
+
+  /* ── On-chain verification ── */
+  async function verifyOnChain(wallet) {{
+    const result = {{ tokenOk: false, nftOk: false, tokenBalance: null, nftCount: null }};
+    const $status = document.getElementById('verifyStatus');
+    const $fill = document.getElementById('progressFill');
+
+    // Step: token balance check
+    if ((REG_MODE === 'token' || REG_MODE === 'both') && TOKEN_TYPE) {{
+      $status.textContent = 'Checking token balance…';
+      $fill.style.width = '25%';
+      try {{
+        const bal = await suiRpc('suix_getBalance', [wallet, TOKEN_TYPE]);
+        const raw = BigInt(bal.totalBalance || '0');
+        result.tokenBalance = Number(raw) / Math.pow(10, DECIMALS);
+        result.tokenOk = result.tokenBalance >= MIN_HOLDING;
+      }} catch (e) {{
+        // RPC failure: let the bot do server-side verification as fallback.
+        result.tokenBalance = null;
+      }}
+      $fill.style.width = '50%';
+    }}
+
+    // Step: NFT ownership check
+    if ((REG_MODE === 'nft' || REG_MODE === 'both') && NFT_COLLECTION) {{
+      $status.textContent = 'Checking NFT ownership…';
+      $fill.style.width = '60%';
+      try {{
+        let count = 0;
+        let cursor = null;
+        // Paginate through owned objects to count NFTs from the collection.
+        // suix_getOwnedObjects params: [owner, query, cursor, limit]
+        do {{
+          const query = {{ options: {{ showType: true }} }};
+          const page = await suiRpc('suix_getOwnedObjects', [wallet, query, cursor, 50]);
+          const items = page.data || [];
+          for (const item of items) {{
+            const obj = item.data || {{}};
+            const objType = (obj.type || '').toLowerCase();
+            const objId = (obj.objectId || '').toLowerCase();
+            if (!objType || objType.indexOf('::') === -1) continue;
+            if (objType.indexOf('coin::') !== -1) continue;
+            // Match by collection ID prefix in objectId or type string
+            const collLower = NFT_COLLECTION.toLowerCase();
+            if (objId.indexOf(collLower) !== -1 || objType.indexOf(collLower) !== -1) {{
+              count++;
+            }}
+          }}
+          cursor = page.hasNextPage ? page.nextCursor : null;
+        }} while (cursor && count < NFT_THRESHOLD);
+        result.nftCount = count;
+        result.nftOk = count >= NFT_THRESHOLD;
+      }} catch (e) {{
+        result.nftCount = null;
+      }}
+      $fill.style.width = '80%';
+    }}
+
+    $status.textContent = 'Finalising…';
+    $fill.style.width = '100%';
+
+    return result;
+  }}
+
+  /* ── Render result ── */
+  function showResult(wallet, check) {{
+    let passed = false;
+    if (REG_MODE === 'token') passed = check.tokenOk;
+    else if (REG_MODE === 'nft') passed = check.nftOk;
+    else if (REG_MODE === 'both') passed = check.tokenOk || check.nftOk;
+
+    const $rc = document.getElementById('resultCard');
+    if (passed) {{
+      $rc.innerHTML =
+        '<div class="result-icon">✅</div>' +
+        '<h2>Verification Passed!</h2>' +
+        '<p>Your wallet meets the group requirements.<br>Sending result to the bot…</p>';
+    }} else {{
+      $rc.innerHTML =
+        '<div class="result-icon">❌</div>' +
+        '<h2>Requirements Not Met</h2>' +
+        '<p>Your wallet does not currently meet the group\'s token/NFT requirements.</p>';
+    }}
+
+    // Show detail rows
+    const $details = document.getElementById('detailsCard');
+    const $rows = document.getElementById('detailRows');
+    $rows.innerHTML = '';
+    const tokenParts = TOKEN_TYPE.split('::');
+    const tokenSymbol = tokenParts.length >= 3 ? tokenParts[tokenParts.length - 1] : TOKEN_TYPE;
+
+    if (check.tokenBalance !== null) {{
+      const row = document.createElement('div');
+      row.className = 'detail-row';
+      const ok = check.tokenOk;
+      row.innerHTML = '<span class="dt">Token Balance</span><span class="dd ' + (ok ? 'pass' : 'fail') + '">' +
+        Number(check.tokenBalance).toLocaleString(undefined, {{maximumFractionDigits: 2}}) + ' ' + tokenSymbol +
+        ' ' + (ok ? '✓' : '✗') + '</span>';
+      $rows.appendChild(row);
+    }}
+    if (check.nftCount !== null) {{
+      const row = document.createElement('div');
+      row.className = 'detail-row';
+      const ok = check.nftOk;
+      row.innerHTML = '<span class="dt">NFTs Owned</span><span class="dd ' + (ok ? 'pass' : 'fail') + '">' +
+        check.nftCount + ' ' + (ok ? '✓' : '✗') + '</span>';
+      $rows.appendChild(row);
+    }}
+    const walletRow = document.createElement('div');
+    walletRow.className = 'detail-row';
+    walletRow.innerHTML = '<span class="dt">Wallet</span><span class="dd" style="font-size:11px;word-break:break-all;">' +
+      wallet.slice(0, 6) + '…' + wallet.slice(-6) + '</span>';
+    $rows.appendChild(walletRow);
+
+    if ($rows.children.length > 0) $details.style.display = '';
+
+    goToSection(3);
+    return passed;
+  }}
+
+  /* ── Submit handler ── */
+  $verifyBtn.addEventListener('click', async function() {{
+    const wallet = $wallet.value.trim();
+    if (!isValidSuiAddress(wallet)) return;
+
+    $verifyBtn.disabled = true;
+    $walletAlert.className = 'alert';
+
+    goToSection(2);
+
+    let check;
+    try {{
+      check = await verifyOnChain(wallet);
+    }} catch (err) {{
+      // On unexpected error, send wallet to bot without client-side results.
+      check = {{ tokenOk: false, nftOk: false, tokenBalance: null, nftCount: null }};
+    }}
+
+    const passed = showResult(wallet, check);
+
+    // Build payload to send back to the bot.
+    const payload = {{
+      wallet_address: wallet,
+      group_id: GROUP_ID,
+      tg_user_id: TG_USER_ID,
+      balance_verified: passed,
+      token_type: TOKEN_TYPE,
+      required_balance: REQUIRED_BAL,
+      token_balance: check.tokenBalance,
+      nft_count: check.nftCount
+    }};
+
+    if (isWebApp) {{
+      // Inside Telegram WebApp: send data back via Telegram channel, then close.
+      setTimeout(function() {{
+        tg.sendData(JSON.stringify(payload));
+      }}, passed ? 1200 : 2500);
+    }} else {{
+      // External browser fallback: POST to bot API.
+      const $alert = document.getElementById('resultAlert');
+      try {{
+        const resp = await fetch(API_VERIFY_URL, {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload)
+        }});
+        const result = await resp.json();
+        if (result.success) {{
+          $alert.textContent = '✅ Wallet verified! Check Telegram for your confirmation and group invite link.';
+          $alert.className = 'alert alert-success show';
+        }} else {{
+          $alert.textContent = '❌ ' + (result.error || 'Verification failed. Please try again.');
+          $alert.className = 'alert alert-error show';
+        }}
+      }} catch (_) {{
+        $alert.textContent = '❌ Network error. Please try again.';
+        $alert.className = 'alert alert-error show';
+      }}
+    }}
+  }});
+
+}})();
+</script>
 </body>
-</html>
-    """
+</html>"""
     return html
 
 
