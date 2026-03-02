@@ -3141,7 +3141,7 @@ def handle_start(message):
                 markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
                 bot.reply_to(
                     message,
-                    "🔐 *Wallet Registration*\n\nTap **Verify Wallet** to open the mini-app and verify your SUI wallet.\nYour holdings will be checked on-chain — all within Telegram!",
+                    "🔐 *Wallet Registration*\n\nTap **Verify Wallet** to connect your SUI wallet and verify automatically.\nJust sign in with your wallet — your address is detected instantly!",
                     reply_markup=markup,
                     parse_mode="Markdown"
                 )
@@ -3441,8 +3441,8 @@ def register_wallets(message):
         message_thread_id = getattr(message, 'message_thread_id', None)
         register_text = (
             "🔐 **Wallet Registration**\n\n"
-            "Tap **Verify Wallet** to open the mini-app and verify your SUI wallet.\n"
-            "Your token/NFT holdings will be checked on-chain automatically — all within Telegram!"
+            "Tap **Verify Wallet** to connect your SUI wallet and verify automatically.\n"
+            "Just sign in with your wallet — your address is detected and verified on-chain instantly!"
         )
 
         if message_thread_id:
@@ -3919,7 +3919,54 @@ def wallet_connect_webapp():
     .req-item .label {{ color: var(--muted); font-size: 11px; }}
     .req-item .value {{ font-weight: 600; }}
 
-    /* ── Wallet input ── */
+    /* ── Wallet list ── */
+    .wallet-list {{
+      display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px;
+    }}
+    .wallet-item {{
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px; background: var(--card2); border-radius: 10px;
+      border: 1px solid var(--border); cursor: pointer;
+      transition: all .2s;
+    }}
+    .wallet-item:hover {{ border-color: var(--blue); background: var(--bg); }}
+    .wallet-item .w-icon {{
+      width: 36px; height: 36px; border-radius: 8px; background: var(--card);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px; flex-shrink: 0; overflow: hidden;
+    }}
+    .wallet-item .w-icon img {{ width: 100%; height: 100%; object-fit: cover; border-radius: 8px; }}
+    .wallet-item .w-name {{ font-weight: 600; font-size: 14px; }}
+    .wallet-item .w-hint {{ font-size: 11px; color: var(--muted); }}
+    .wallet-item .w-arrow {{ margin-left: auto; color: var(--muted); font-size: 18px; }}
+    .wallet-item.connected {{ border-color: var(--green); }}
+    .wallet-item.connected .w-arrow {{ color: var(--green); }}
+
+    /* ── Connected wallet display ── */
+    .connected-wallet {{
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 14px; background: var(--green-bg); border-radius: 10px;
+      border: 1px solid var(--green); margin-bottom: 12px; font-size: 13px;
+    }}
+    .connected-wallet .cw-icon {{ font-size: 20px; }}
+    .connected-wallet .cw-addr {{
+      font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px;
+      color: var(--green-text); word-break: break-all;
+    }}
+
+    /* ── Manual entry toggle ── */
+    .manual-toggle {{
+      text-align: center; margin-top: 12px;
+    }}
+    .manual-toggle button {{
+      background: none; border: none; color: var(--muted); font-size: 12px;
+      cursor: pointer; text-decoration: underline; padding: 4px;
+    }}
+    .manual-toggle button:hover {{ color: var(--text); }}
+    .manual-entry {{ display: none; margin-top: 12px; }}
+    .manual-entry.show {{ display: block; }}
+
+    /* ── Wallet input (manual fallback) ── */
     .input-group {{
       position: relative;
     }}
@@ -4011,6 +4058,10 @@ def wallet_connect_webapp():
     /* ── Fade-in animation ── */
     @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: none; }} }}
     .section.active {{ animation: fadeIn .3s ease; }}
+
+    /* ── Scanning animation ── */
+    .scanning {{ text-align: center; padding: 16px 0 8px; }}
+    .scanning .spinner {{ width: 24px; height: 24px; }}
   </style>
 </head>
 <body>
@@ -4019,14 +4070,14 @@ def wallet_connect_webapp():
   <div class="header">
     <div class="logo">🔐</div>
     <h1>Wallet Verification</h1>
-    <div class="subtitle">Verify your SUI wallet — right here in Telegram</div>
+    <div class="subtitle">Connect your SUI wallet to verify — right here in Telegram</div>
   </div>
 
   <!-- Step indicators -->
   <div class="steps">
     <div class="step active" id="step1">
       <div class="dot">1</div>
-      <span>Wallet</span>
+      <span>Connect</span>
     </div>
     <div class="step-line" id="line1"></div>
     <div class="step" id="step2">
@@ -4040,7 +4091,7 @@ def wallet_connect_webapp():
     </div>
   </div>
 
-  <!-- ▸ SECTION 1: Enter wallet -->
+  <!-- ▸ SECTION 1: Connect wallet -->
   <div class="section active" id="sec-wallet">
     <!-- Requirements info -->
     <div class="card" id="reqCard">
@@ -4048,18 +4099,47 @@ def wallet_connect_webapp():
       <div id="reqList"></div>
     </div>
 
-    <div class="card">
-      <h2>Enter SUI Wallet Address</h2>
-      <div class="input-group">
-        <input id="wallet" type="text" placeholder="0x..." autocomplete="off"
-               spellcheck="false" autocapitalize="none" />
-        <button class="paste-btn" id="pasteBtn">📋 Paste</button>
+    <div class="card" id="connectCard">
+      <h2>🔗 Connect Your SUI Wallet</h2>
+      <p style="color:var(--muted); font-size:13px; margin-bottom:14px;">
+        Choose a wallet below to sign in. Your address will be detected automatically.
+      </p>
+
+      <!-- Detected wallets will be rendered here -->
+      <div id="walletList" class="wallet-list"></div>
+
+      <!-- Scanning indicator (shown while detecting wallets) -->
+      <div id="walletScanning" class="scanning">
+        <div class="spinner"></div>
+        <p style="color:var(--muted); font-size:12px; margin-top:8px;">Detecting wallets…</p>
       </div>
-      <div class="input-hint" id="inputHint">Paste or type your SUI wallet address (0x...)</div>
+
+      <!-- Connected wallet indicator (hidden initially) -->
+      <div id="connectedWallet" class="connected-wallet" style="display:none;">
+        <span class="cw-icon">✅</span>
+        <div>
+          <div style="font-weight:600; font-size:13px; color:var(--green-text);">Wallet Connected</div>
+          <div class="cw-addr" id="connectedAddr"></div>
+        </div>
+      </div>
+
       <button class="btn btn-primary" id="verifyBtn" disabled>
         Verify On-Chain
       </button>
       <div class="alert" id="walletAlert"></div>
+
+      <!-- Manual entry fallback (collapsed by default) -->
+      <div class="manual-toggle" id="manualToggle">
+        <button id="manualToggleBtn">No wallet extension? Enter address manually ▾</button>
+      </div>
+      <div class="manual-entry" id="manualEntry">
+        <div class="input-group">
+          <input id="wallet" type="text" placeholder="0x..." autocomplete="off"
+                 spellcheck="false" autocapitalize="none" />
+          <button class="paste-btn" id="pasteBtn">📋 Paste</button>
+        </div>
+        <div class="input-hint" id="inputHint">Paste or type your SUI wallet address (0x…)</div>
+      </div>
     </div>
   </div>
 
@@ -4119,11 +4199,14 @@ def wallet_connect_webapp():
   const NFT_THRESHOLD   = {safe_nft_threshold};
   const API_VERIFY_URL  = {js_api_verify_url};
 
+  /* ── State ── */
+  let connectedAddress = '';
+
   /* ── DOM refs ── */
-  const $wallet    = document.getElementById('wallet');
-  const $pasteBtn  = document.getElementById('pasteBtn');
-  const $verifyBtn = document.getElementById('verifyBtn');
-  const $hint      = document.getElementById('inputHint');
+  const $wallet      = document.getElementById('wallet');
+  const $pasteBtn    = document.getElementById('pasteBtn');
+  const $verifyBtn   = document.getElementById('verifyBtn');
+  const $hint        = document.getElementById('inputHint');
   const $walletAlert = document.getElementById('walletAlert');
 
   /* ── Render requirements panel ── */
@@ -4131,7 +4214,6 @@ def wallet_connect_webapp():
     const $list = document.getElementById('reqList');
     const items = [];
     if ((REG_MODE === 'token' || REG_MODE === 'both') && TOKEN_TYPE) {{
-      // Show a human-friendly token name extracted from the fully-qualified type.
       const parts = TOKEN_TYPE.split('::');
       const symbol = parts.length >= 3 ? parts[parts.length - 1] : TOKEN_TYPE;
       items.push({{
@@ -4169,20 +4251,263 @@ def wallet_connect_webapp():
     return /^0x[0-9a-fA-F]{{40,64}}$/.test((addr || '').trim());
   }}
 
+  /* ── Update connected state ── */
+  function setConnectedWallet(addr) {{
+    connectedAddress = addr;
+    const $cw = document.getElementById('connectedWallet');
+    const $ca = document.getElementById('connectedAddr');
+    if (addr) {{
+      $ca.textContent = addr.slice(0, 10) + '…' + addr.slice(-8);
+      $cw.style.display = 'flex';
+      $verifyBtn.disabled = false;
+      $verifyBtn.textContent = 'Verify On-Chain';
+      // Hide the manual entry if wallet was connected via extension
+      document.getElementById('manualEntry').classList.remove('show');
+    }} else {{
+      $cw.style.display = 'none';
+      $verifyBtn.disabled = true;
+    }}
+  }}
+
+  /* ══════════════════════════════════════════════════════
+     ── SUI Wallet Standard: detect & connect wallets ──
+     ══════════════════════════════════════════════════════ */
+
+  function discoverWallets() {{
+    /* The Wallet Standard specifies that wallets register themselves via
+       a global "register" event on window.  The `getWallets` helper (from
+       @wallet-standard/app) provides a snapshot + listener.  However,
+       since we are in an inline page without npm, we probe the standard
+       globals that compliant wallets inject.  */
+    const found = [];
+    try {{
+      // Method 1: Wallet Standard registry (used by Slush / Sui Wallet, Suiet, Nightly, etc.)
+      if (window.__wallet_standard__ && window.__wallet_standard__.wallets) {{
+        const reg = window.__wallet_standard__.wallets;
+        // reg may be an array or have a get() method
+        const list = typeof reg.get === 'function' ? reg.get() : (Array.isArray(reg) ? reg : []);
+        for (const w of list) {{
+          // Only include wallets that support the SUI chain
+          const chains = w.chains || [];
+          const hasSui = chains.some(function(c) {{ return c.startsWith('sui:'); }});
+          if (hasSui || chains.length === 0) {{
+            found.push(w);
+          }}
+        }}
+      }}
+
+      // Method 2: Check for well-known injected wallet objects
+      const knownInjections = [
+        {{ key: 'slush',    name: 'Slush (Sui Wallet)' }},
+        {{ key: 'suiWallet', name: 'Sui Wallet' }},
+        {{ key: 'suiet',    name: 'Suiet' }},
+        {{ key: 'nightly',  name: 'Nightly' }},
+        {{ key: 'martian',  name: 'Martian' }},
+        {{ key: 'ethos',    name: 'Ethos' }},
+      ];
+      for (const inj of knownInjections) {{
+        const provider = window[inj.key];
+        if (provider && typeof provider === 'object') {{
+          // Avoid duplicates if already found via wallet standard
+          const isDupe = found.some(function(w) {{
+            return (w.name || '').toLowerCase().indexOf(inj.key.toLowerCase()) !== -1;
+          }});
+          if (!isDupe) {{
+            found.push({{
+              name: inj.name,
+              icon: provider.icon || null,
+              _provider: provider,
+              features: provider.features || {{}},
+              accounts: provider.accounts || [],
+            }});
+          }}
+        }}
+      }}
+    }} catch (e) {{
+      // Wallet detection failed silently — manual fallback will be shown.
+    }}
+    return found;
+  }}
+
+  async function connectToWallet(wallet) {{
+    try {{
+      // Standard connect feature
+      const connectFn = wallet.features && wallet.features['standard:connect']
+        ? wallet.features['standard:connect'].connect
+        : (wallet._provider && typeof wallet._provider.connect === 'function')
+          ? wallet._provider.connect.bind(wallet._provider)
+          : null;
+
+      if (!connectFn) {{
+        throw new Error('Wallet does not support connect');
+      }}
+
+      const result = await connectFn();
+
+      // Extract address from the connected accounts
+      let address = '';
+      const accounts = result && result.accounts ? result.accounts
+        : (wallet.accounts && wallet.accounts.length > 0 ? wallet.accounts : []);
+
+      if (accounts.length > 0) {{
+        address = accounts[0].address || '';
+      }}
+
+      // Fallback: try getAccounts on the provider
+      if (!address && wallet._provider && typeof wallet._provider.getAccounts === 'function') {{
+        const accts = await wallet._provider.getAccounts();
+        if (accts && accts.length > 0) {{
+          address = accts[0] || '';
+        }}
+      }}
+
+      if (!address || !isValidSuiAddress(address)) {{
+        throw new Error('No valid SUI address returned from wallet');
+      }}
+
+      return address;
+    }} catch (e) {{
+      throw e;
+    }}
+  }}
+
+  /* ── Render detected wallets ── */
+  function renderWalletList(wallets) {{
+    const $list = document.getElementById('walletList');
+    const $scanning = document.getElementById('walletScanning');
+    $scanning.style.display = 'none';
+    $list.innerHTML = '';
+
+    if (wallets.length === 0) {{
+      // No wallets detected — show manual entry by default
+      document.getElementById('manualEntry').classList.add('show');
+      document.getElementById('manualToggle').style.display = 'none';
+      // Update the card title
+      document.querySelector('#connectCard h2').textContent = '📝 Enter Your SUI Wallet Address';
+      document.querySelector('#connectCard > p').textContent =
+        'No wallet extension detected. Please enter your SUI wallet address below.';
+      return;
+    }}
+
+    wallets.forEach(function(w) {{
+      const el = document.createElement('div');
+      el.className = 'wallet-item';
+
+      // Wallet icon
+      const iconDiv = document.createElement('div');
+      iconDiv.className = 'w-icon';
+      if (w.icon) {{
+        const img = document.createElement('img');
+        // icon can be a data-URI or URL
+        img.src = typeof w.icon === 'string' ? w.icon : (w.icon.src || '');
+        img.alt = w.name || 'Wallet';
+        img.onerror = function() {{ iconDiv.textContent = '👛'; }};
+        iconDiv.appendChild(img);
+      }} else {{
+        iconDiv.textContent = '👛';
+      }}
+      el.appendChild(iconDiv);
+
+      // Wallet name & hint
+      const info = document.createElement('div');
+      const nameEl = document.createElement('div');
+      nameEl.className = 'w-name';
+      nameEl.textContent = w.name || 'SUI Wallet';
+      info.appendChild(nameEl);
+      const hintEl = document.createElement('div');
+      hintEl.className = 'w-hint';
+      hintEl.textContent = 'Click to connect';
+      info.appendChild(hintEl);
+      el.appendChild(info);
+
+      // Arrow
+      const arrow = document.createElement('span');
+      arrow.className = 'w-arrow';
+      arrow.textContent = '→';
+      el.appendChild(arrow);
+
+      // Click handler: connect to this wallet
+      el.addEventListener('click', async function() {{
+        // Disable all wallet items while connecting
+        const allItems = $list.querySelectorAll('.wallet-item');
+        allItems.forEach(function(item) {{ item.style.pointerEvents = 'none'; item.style.opacity = '0.5'; }});
+        hintEl.textContent = 'Connecting…';
+        arrow.innerHTML = '<span class="spinner"></span>';
+
+        try {{
+          const address = await connectToWallet(w);
+          setConnectedWallet(address);
+          el.classList.add('connected');
+          hintEl.textContent = 'Connected ✓';
+          arrow.textContent = '✓';
+          // Start verification automatically after a brief moment
+          setTimeout(function() {{ startVerification(); }}, 600);
+        }} catch (err) {{
+          hintEl.textContent = 'Connection failed — try again';
+          arrow.textContent = '→';
+          allItems.forEach(function(item) {{ item.style.pointerEvents = ''; item.style.opacity = ''; }});
+          // Show error
+          showAlert('walletAlert', 'Could not connect to ' + (w.name || 'wallet') + '. Try another wallet or enter your address manually.', 'error');
+        }}
+      }});
+
+      $list.appendChild(el);
+    }});
+  }}
+
+  /* ── Start wallet detection ── */
+  function initWalletDiscovery() {{
+    // Give wallet extensions a moment to inject their providers
+    setTimeout(function() {{
+      const wallets = discoverWallets();
+      renderWalletList(wallets);
+
+      // Also listen for late-registering wallets (Wallet Standard event)
+      if (window.__wallet_standard__ && window.__wallet_standard__.wallets) {{
+        const reg = window.__wallet_standard__.wallets;
+        if (typeof reg.on === 'function') {{
+          reg.on('register', function() {{
+            const updated = discoverWallets();
+            renderWalletList(updated);
+          }});
+        }}
+      }}
+    }}, 500);
+  }}
+
+  initWalletDiscovery();
+
+  /* ── Manual entry toggle ── */
+  document.getElementById('manualToggleBtn').addEventListener('click', function() {{
+    const $me = document.getElementById('manualEntry');
+    const isVisible = $me.classList.contains('show');
+    if (isVisible) {{
+      $me.classList.remove('show');
+      this.textContent = 'No wallet extension? Enter address manually ▾';
+    }} else {{
+      $me.classList.add('show');
+      this.textContent = 'Hide manual entry ▴';
+      $wallet.focus();
+    }}
+  }});
+
+  /* ── Manual wallet input validation ── */
   $wallet.addEventListener('input', function() {{
     const v = $wallet.value.trim();
     if (!v) {{
       $hint.textContent = 'Paste or type your SUI wallet address (0x…)';
       $hint.className = 'input-hint';
-      $verifyBtn.disabled = true;
+      if (!connectedAddress) $verifyBtn.disabled = true;
     }} else if (isValidSuiAddress(v)) {{
       $hint.textContent = '✓ Valid SUI address';
       $hint.className = 'input-hint input-valid';
       $verifyBtn.disabled = false;
+      // Use the manually-entered address
+      connectedAddress = v;
     }} else {{
       $hint.textContent = '✗ Invalid format — must be 0x followed by 40-64 hex characters';
       $hint.className = 'input-hint input-invalid';
-      $verifyBtn.disabled = true;
+      if (!connectedAddress) $verifyBtn.disabled = true;
     }}
   }});
 
@@ -4195,12 +4520,18 @@ def wallet_connect_webapp():
         $wallet.dispatchEvent(new Event('input'));
       }}
     }} catch (_) {{
-      // Clipboard API not available — show hint instead of silently failing.
       $pasteBtn.textContent = '⌨️ Type';
       $pasteBtn.title = 'Clipboard not available — please type your address manually';
       $pasteBtn.disabled = true;
     }}
   }});
+
+  /* ── Alert helper ── */
+  function showAlert(id, msg, type) {{
+    const el = document.getElementById(id);
+    el.textContent = msg;
+    el.className = 'alert alert-' + type + ' show';
+  }}
 
   /* ── Section / step management ── */
   function goToSection(n) {{
@@ -4248,13 +4579,11 @@ def wallet_connect_webapp():
         const bal = await suiRpc('suix_getBalance', [wallet, TOKEN_TYPE]);
         const raw = BigInt(bal.totalBalance || '0');
         const divisor = BigInt(Math.pow(10, DECIMALS));
-        // Integer part via BigInt; fractional part via remainder to avoid precision loss.
         const intPart = Number(raw / divisor);
         const fracPart = Number(raw % divisor) / Number(divisor);
         result.tokenBalance = intPart + fracPart;
         result.tokenOk = result.tokenBalance >= MIN_HOLDING;
       }} catch (e) {{
-        // RPC failure: let the bot do server-side verification as fallback.
         result.tokenBalance = null;
       }}
       $fill.style.width = '50%';
@@ -4267,8 +4596,6 @@ def wallet_connect_webapp():
       try {{
         let count = 0;
         let cursor = null;
-        // Paginate through owned objects to count NFTs from the collection.
-        // suix_getOwnedObjects params: [owner, query, cursor, limit]
         do {{
           const query = {{ options: {{ showType: true }} }};
           const page = await suiRpc('suix_getOwnedObjects', [wallet, query, cursor, 50]);
@@ -4278,7 +4605,6 @@ def wallet_connect_webapp():
             const objType = (obj.type || '').toLowerCase();
             if (!objType || objType.indexOf('::') === -1) continue;
             if (objType.indexOf('coin::') !== -1) continue;
-            // Match: type string starts with the collection package ID (e.g. "0xabc123::module::Type")
             const collLower = NFT_COLLECTION.toLowerCase();
             if (objType.startsWith(collLower + '::') || objType === collLower) {{
               count++;
@@ -4320,7 +4646,6 @@ def wallet_connect_webapp():
         '<p>Your wallet does not currently meet the group\'s token/NFT requirements.</p>';
     }}
 
-    // Show detail rows
     const $details = document.getElementById('detailsCard');
     const $rows = document.getElementById('detailRows');
     $rows.innerHTML = '';
@@ -4356,13 +4681,13 @@ def wallet_connect_webapp():
     return passed;
   }}
 
-  /* ── Submit handler ── */
-  $verifyBtn.addEventListener('click', async function() {{
-    const wallet = $wallet.value.trim();
+  /* ── Main verification flow ── */
+  async function startVerification() {{
+    const wallet = connectedAddress || $wallet.value.trim();
     if (!isValidSuiAddress(wallet)) return;
 
     $verifyBtn.disabled = true;
-    $walletAlert.className = 'alert';
+    document.getElementById('walletAlert').className = 'alert';
 
     goToSection(2);
 
@@ -4370,7 +4695,6 @@ def wallet_connect_webapp():
     try {{
       check = await verifyOnChain(wallet);
     }} catch (err) {{
-      // On unexpected error, send wallet to bot without client-side results.
       check = {{ tokenOk: false, nftOk: false, tokenBalance: null, nftCount: null }};
     }}
 
@@ -4389,12 +4713,10 @@ def wallet_connect_webapp():
     }};
 
     if (isWebApp) {{
-      // Inside Telegram WebApp: send data back via Telegram channel, then close.
       setTimeout(function() {{
         tg.sendData(JSON.stringify(payload));
       }}, passed ? 1200 : 2500);
     }} else {{
-      // External browser fallback: POST to bot API.
       const $alert = document.getElementById('resultAlert');
       try {{
         const resp = await fetch(API_VERIFY_URL, {{
@@ -4415,6 +4737,11 @@ def wallet_connect_webapp():
         $alert.className = 'alert alert-error show';
       }}
     }}
+  }}
+
+  /* ── Submit handler (manual verify button click) ── */
+  $verifyBtn.addEventListener('click', function() {{
+    startVerification();
   }});
 
 }})();
