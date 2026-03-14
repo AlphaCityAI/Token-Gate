@@ -4051,6 +4051,21 @@ def wallet_connect_webapp():
     .alert-success {{ background: var(--green-bg); color: var(--green-text); }}
     .alert-info {{ background: var(--blue-bg); color: #93c5fd; }}
 
+    /* ── External-browser prompt ── */
+    .browser-prompt {{
+      background: var(--blue-bg); border: 1px solid var(--blue);
+      border-radius: var(--radius); padding: 16px; margin-bottom: 12px;
+      text-align: center;
+    }}
+    .browser-prompt .bp-icon {{ font-size: 32px; margin-bottom: 8px; }}
+    .browser-prompt p {{
+      color: #93c5fd; font-size: 13px; line-height: 1.5; margin-bottom: 14px;
+    }}
+    .btn-browser {{
+      background: var(--blue); color: #fff;
+    }}
+    .btn-browser:hover {{ filter: brightness(1.1); }}
+
     /* ── Sections ── */
     .section {{ display: none; }}
     .section.active {{ display: block; }}
@@ -4379,13 +4394,49 @@ def wallet_connect_webapp():
     $list.innerHTML = '';
 
     if (wallets.length === 0) {{
-      // No wallets detected — show manual entry by default
-      document.getElementById('manualEntry').classList.add('show');
-      document.getElementById('manualToggle').style.display = 'none';
-      // Update the card title
-      document.querySelector('#connectCard h2').textContent = '📝 Enter Your SUI Wallet Address';
-      document.querySelector('#connectCard > p').textContent =
-        'No wallet extension detected. Please enter your SUI wallet address below.';
+      if (isWebApp && tg) {{
+        // ── Inside Telegram's embedded browser ─────────────────────────────
+        // Wallet extensions (Slush, Suiet, Nightly, etc.) cannot be injected
+        // into Telegram's sandboxed WebView on any platform (iOS, Android, or
+        // Desktop).  The fix: open this same URL in the user's default browser
+        // via Telegram.WebApp.openLink(), where extensions ARE available and
+        // can connect normally.  The external browser path POSTs to /api/verify
+        // which sends the confirmation back to the user via the bot.
+        document.querySelector('#connectCard h2').textContent = '🔗 Connect Your SUI Wallet';
+        document.querySelector('#connectCard > p').textContent =
+          'Wallet extensions cannot run inside Telegram\'s browser. ' +
+          'Tap the button below to open this page in your device\'s browser ' +
+          'where your Sui wallet app can connect.';
+
+        // "Open in External Browser" primary CTA
+        var bpDiv = document.createElement('div');
+        bpDiv.className = 'browser-prompt';
+        bpDiv.innerHTML =
+          '<div class="bp-icon">🌐</div>' +
+          '<p>Your Sui wallet extension (Slush, Suiet, Nightly, etc.) will be ' +
+          'detected automatically once you open this page in your browser.</p>';
+        var openBtn = document.createElement('button');
+        openBtn.className = 'btn btn-browser';
+        openBtn.style.marginTop = '0';
+        openBtn.textContent = '🌐 Open in External Browser';
+        openBtn.addEventListener('click', function() {{
+          tg.openLink(window.location.href);
+        }});
+        bpDiv.appendChild(openBtn);
+        $list.appendChild(bpDiv);
+
+        // Manual entry as secondary fallback — keep toggle visible but relabelled
+        document.getElementById('manualToggleBtn').textContent =
+          'No wallet app? Enter address manually ▾';
+      }} else {{
+        // ── In external browser (or standalone) ────────────────────────────
+        // No wallet extension installed — just show the manual entry form.
+        document.getElementById('manualEntry').classList.add('show');
+        document.getElementById('manualToggle').style.display = 'none';
+        document.querySelector('#connectCard h2').textContent = '📝 Enter Your SUI Wallet Address';
+        document.querySelector('#connectCard > p').textContent =
+          'No wallet extension detected. Please enter your SUI wallet address below.';
+      }}
       return;
     }}
 
@@ -4483,8 +4534,14 @@ def wallet_connect_webapp():
     const isVisible = $me.classList.contains('show');
     if (isVisible) {{
       $me.classList.remove('show');
-      this.textContent = 'No wallet extension? Enter address manually ▾';
+      // Restore the button text that was set when the toggle was last shown
+      // (may have been customised by renderWalletList for the Telegram case).
+      this.textContent = this.dataset.collapseText || 'No wallet extension? Enter address manually ▾';
     }} else {{
+      // Remember the current collapsed-state label so we can restore it.
+      if (!this.dataset.collapseText) {{
+        this.dataset.collapseText = this.textContent;
+      }}
       $me.classList.add('show');
       this.textContent = 'Hide manual entry ▴';
       $wallet.focus();
