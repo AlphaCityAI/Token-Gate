@@ -3088,7 +3088,7 @@ def handle_chat_member_update(update):
                                 wallet_address = NULL
                         """, (user_id, group_id))
                 except Exception as pv_err:
-                    logging.warning(f"Could not store pending verification for new member {user_id}: {pv_err}")
+                    logging.warning(f"Could not store pending verification for new member {user_id} in group {group_id}: {pv_err}")
 
                 # Create inline keyboard with registration button
                 markup = types.InlineKeyboardMarkup()
@@ -4397,14 +4397,15 @@ def wallet_connect_webapp():
     $list.innerHTML = '';
 
     if (wallets.length === 0) {{
-      if (isWebApp && tg) {{
-        // ── Inside Telegram's embedded browser ─────────────────────────────
+      if (tg) {{
+        // ── Inside any Telegram browser (WebApp OR URL-button in-app browser) ──
         // Wallet extensions (Slush, Suiet, Nightly, etc.) cannot be injected
-        // into Telegram's sandboxed WebView on any platform (iOS, Android, or
-        // Desktop).  The fix: open this same URL in the user's default browser
-        // via Telegram.WebApp.openLink(), where extensions ARE available and
-        // can connect normally.  The external browser path POSTs to /api/verify
-        // which sends the confirmation back to the user via the bot.
+        // into Telegram's sandboxed browser on any platform (iOS, Android, or
+        // Desktop), whether opened as a WebApp or via a URL button.
+        // The fix: open this same URL in the user's system browser via
+        // Telegram.WebApp.openLink(), where extensions ARE available and can
+        // connect normally.  The verification result is then POSTed to
+        // /api/verify which sends the confirmation back to the user via the bot.
         document.querySelector('#connectCard h2').textContent = '🔗 Connect Your SUI Wallet';
         document.querySelector('#connectCard > p').textContent =
           'Wallet extensions cannot run inside Telegram\'s browser. ' +
@@ -4423,7 +4424,13 @@ def wallet_connect_webapp():
         openBtn.style.marginTop = '0';
         openBtn.textContent = '🌐 Open in External Browser';
         openBtn.addEventListener('click', function() {{
-          tg.openLink(window.location.href);
+          var url = window.location.href;
+          // tg.openLink works in both WebApp mode and Telegram's in-app browser.
+          if (tg && typeof tg.openLink === 'function') {{
+            tg.openLink(url);
+          }} else {{
+            window.open(url, '_blank');
+          }}
         }});
         bpDiv.appendChild(openBtn);
         $list.appendChild(bpDiv);
@@ -4514,17 +4521,20 @@ def wallet_connect_webapp():
 
   /* ── Start wallet detection ── */
   function initWalletDiscovery() {{
-    // Use a short delay so wallet extensions can inject their providers, then
-    // render immediately.  A brief pause is still needed because extensions
-    // typically inject asynchronously after page load.
+    // A brief delay (100 ms) lets wallet extensions complete their synchronous
+    // injection into window.__wallet_standard__ / window.<name> before we
+    // probe.  Extensions inject during script initialisation (well before
+    // DOMContentLoaded), so 100 ms is plenty even on slow devices.
+    // The Wallet Standard 'register' listener below also catches any
+    // late-registering wallets that arrive after the timeout.
     setTimeout(function() {{
       const wallets = discoverWallets();
       renderWalletList(wallets);
 
-      // In an external browser (not Telegram WebView), auto-trigger the
-      // connection popup when exactly one wallet is detected so the user
-      // sees the sign-in prompt immediately without an extra click.
-      if (!isWebApp && wallets.length === 1) {{
+      // In a true external browser (not any Telegram browser context),
+      // auto-trigger the connection popup when exactly one wallet is detected
+      // so the user sees the sign-in prompt immediately without an extra click.
+      if (!tg && wallets.length === 1) {{
         var firstItem = document.querySelector('#walletList .wallet-item');
         if (firstItem) firstItem.click();
       }}
