@@ -3075,17 +3075,34 @@ def handle_chat_member_update(update):
 
             # Send registration reminder
             try:
+                # Store pending verification context so /api/verify can look up
+                # the group even if the group_id is absent from the POST body.
+                try:
+                    with get_db_cursor() as (conn, cur):
+                        cur.execute("""
+                            INSERT INTO pending_verifications (user_id, group_id, created_at)
+                            VALUES (%s, %s, NOW())
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                group_id = EXCLUDED.group_id,
+                                created_at = EXCLUDED.created_at,
+                                wallet_address = NULL
+                        """, (user_id, group_id))
+                except Exception as pv_err:
+                    logging.warning(f"Could not store pending verification for new member {user_id}: {pv_err}")
+
                 # Create inline keyboard with registration button
                 markup = types.InlineKeyboardMarkup()
-                deep_link = f"https://t.me/{bot.get_me().username}?start=register_{group_id}"
-                register_btn = types.InlineKeyboardButton("📱 Register in Private Chat", url=deep_link)
+                # Build a direct verify URL so the user goes straight to
+                # the /verify page in their external browser.
+                verify_url = build_wallet_connect_url(group_id, user_id, cfg=config if config else None)
+                register_btn = types.InlineKeyboardButton("✅ Verify Wallet", url=verify_url)
                 markup.add(register_btn)
 
                 # Send welcome message with registration prompt
                 welcome_text = (
                     f"👋 Welcome to the group, {user_name}!\n\n"
-                    "To participate in this group, you'll need to register your wallet address. "
-                    "Click the button below to register securely in private chat."
+                    "To participate in this group, you'll need to verify your wallet. "
+                    "Tap the button below to connect your SUI wallet and verify your holdings."
                 )
 
                 sent_message = bot.send_message(
@@ -3132,16 +3149,17 @@ def handle_start(message):
                             created_at = EXCLUDED.created_at,
                             wallet_address = NULL
                     """, (message.from_user.id, group_id))
-                # Show verify button directly in private chat (WebApp buttons work here)
+                # Send a URL button that opens the /verify page directly in the
+                # user's external browser so wallet extensions are available.
                 with config_lock:
                     group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
                 connect_url = build_wallet_connect_url(group_id, message.from_user.id, cfg=group_cfg)
-                webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
+                verify_url = f"{connect_url}&source=telegram_register"
                 markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
+                markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=verify_url))
                 bot.reply_to(
                     message,
-                    "🔐 *Wallet Registration*\n\nTap **Verify Wallet** to connect your SUI wallet and verify automatically.\nJust sign in with your wallet — your address is detected instantly!",
+                    "🔐 *Wallet Registration*\n\nTap **Verify Wallet** to open the verification page and connect your SUI wallet.",
                     reply_markup=markup,
                     parse_mode="Markdown"
                 )
@@ -3416,33 +3434,18 @@ def register_wallets(message):
 
         with config_lock:
             group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
+        # Always use a URL button so the /verify page opens in the user's
+        # external browser where wallet extensions are available.
+        connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
+        verify_url = f"{connect_url}&source=telegram_register"
         markup = types.InlineKeyboardMarkup()
-
-        if is_private:
-            # Telegram supports WebApp buttons in private chats – open the
-            # built-in mini-app directly so the user never leaves Telegram.
-            connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
-            webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
-            markup.add(types.InlineKeyboardButton("✅ Verify Wallet", web_app=types.WebAppInfo(url=webapp_url)))
-        else:
-            # In group chats, WebApp buttons are not supported. Use a deep-link
-            # to the bot's private chat which will show the WebApp button there,
-            # keeping the entire flow inside Telegram.
-            try:
-                bot_username = bot.get_me().username
-                deep_link = f"https://t.me/{bot_username}?start=register_{group_id}"
-                markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=deep_link))
-            except Exception:
-                # Fallback: direct URL (only if deep-link fails)
-                connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
-                webapp_url = f"{connect_url}&source=telegram_register&origin=telegram"
-                markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=webapp_url))
+        markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=verify_url))
 
         message_thread_id = getattr(message, 'message_thread_id', None)
         register_text = (
             "🔐 **Wallet Registration**\n\n"
-            "Tap **Verify Wallet** to connect your SUI wallet and verify automatically.\n"
-            "Just sign in with your wallet — your address is detected and verified on-chain instantly!"
+            "Tap **Verify Wallet** to open the verification page and connect your SUI wallet.\n"
+            "Your wallet is verified on-chain automatically!"
         )
 
         if message_thread_id:
@@ -4430,12 +4433,15 @@ def wallet_connect_webapp():
           'No wallet app? Enter address manually ▾';
       }} else {{
         // ── In external browser (or standalone) ────────────────────────────
-        // No wallet extension installed — just show the manual entry form.
-        document.getElementById('manualEntry').classList.add('show');
-        document.getElementById('manualToggle').style.display = 'none';
+        // No wallet extension detected.  Offer a system-browser link as a
+        // fallback for users on desktop Telegram's in-app browser, then fall
+        // back to manual address entry.
         document.querySelector('#connectCard h2').textContent = '📝 Enter Your SUI Wallet Address';
         document.querySelector('#connectCard > p').textContent =
-          'No wallet extension detected. Please enter your SUI wallet address below.';
+          'No wallet extension detected. Install a SUI wallet (Slush, Suiet, Nightly, etc.) ' +
+          'or enter your address manually below.';
+        document.getElementById('manualEntry').classList.add('show');
+        document.getElementById('manualToggle').style.display = 'none';
       }}
       return;
     }}
@@ -4508,10 +4514,20 @@ def wallet_connect_webapp():
 
   /* ── Start wallet detection ── */
   function initWalletDiscovery() {{
-    // Give wallet extensions a moment to inject their providers
+    // Use a short delay so wallet extensions can inject their providers, then
+    // render immediately.  A brief pause is still needed because extensions
+    // typically inject asynchronously after page load.
     setTimeout(function() {{
       const wallets = discoverWallets();
       renderWalletList(wallets);
+
+      // In an external browser (not Telegram WebView), auto-trigger the
+      // connection popup when exactly one wallet is detected so the user
+      // sees the sign-in prompt immediately without an extra click.
+      if (!isWebApp && wallets.length === 1) {{
+        var firstItem = document.querySelector('#walletList .wallet-item');
+        if (firstItem) firstItem.click();
+      }}
 
       // Also listen for late-registering wallets (Wallet Standard event)
       if (window.__wallet_standard__ && window.__wallet_standard__.wallets) {{
@@ -4523,7 +4539,7 @@ def wallet_connect_webapp():
           }});
         }}
       }}
-    }}, 500);
+    }}, 100);
   }}
 
   initWalletDiscovery();
