@@ -57,7 +57,7 @@ BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 SUI_RPC_URL = os.getenv('SUI_RPC_URL', 'https://fullnode.mainnet.sui.io:443')
 WALLET_CONNECT_URL = os.getenv('WALLET_CONNECT_URL', '').strip()
 PUBLIC_WEBAPP_BASE_URL = os.getenv('PUBLIC_WEBAPP_BASE_URL', '').strip()
-HARDCODED_WALLET_CONNECT_URL = 'https://token-gate-bot-production.up.railway.app/verify'
+FALLBACK_VERIFY_URL = 'https://token-gate-bot-production.up.railway.app/verify'
 # Shared secret for authenticating webhook callbacks from the external verify website.
 # Set WEBHOOK_SECRET in environment variables.  The website must send this value in
 # the X-Webhook-Secret request header when posting to /api/verify.
@@ -99,15 +99,28 @@ connection_pool = None
 
 
 def get_public_webapp_base_url():
+    """Resolve the bot's public web URL for verify and API endpoints.
+
+    Preference order is PUBLIC_WEBAPP_BASE_URL, then Render's
+    RENDER_EXTERNAL_URL, then PUBLIC_URL, then Railway's
+    RAILWAY_PUBLIC_DOMAIN. Railway's domain variable is normalized to HTTPS
+    because it is provided without a scheme.
+    """
     public_base = (
         PUBLIC_WEBAPP_BASE_URL
         or os.getenv('RENDER_EXTERNAL_URL', '').strip()
         or os.getenv('PUBLIC_URL', '').strip()
-        or os.getenv('RAILWAY_PUBLIC_DOMAIN', '').strip()
     )
-    if public_base and not public_base.startswith(('http://', 'https://')):
-        public_base = f"https://{public_base}"
-    return public_base
+    if public_base:
+        return public_base
+
+    railway_public_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN', '').strip()
+    if railway_public_domain:
+        if railway_public_domain.startswith(('http://', 'https://')):
+            return railway_public_domain
+        return f"https://{railway_public_domain}"
+
+    return ''
 
 def db_retry(func):
     """Decorator to handle database connection errors and retry."""
@@ -3367,7 +3380,7 @@ def build_wallet_connect_url(group_id, user_id, cfg=None):
     else:
         base_url = globals().get("WALLET_CONNECT_URL") or os.getenv('WALLET_CONNECT_URL', '').strip()
         if not base_url:
-            base_url = HARDCODED_WALLET_CONNECT_URL
+            base_url = FALLBACK_VERIFY_URL
 
     separator = '&' if '?' in base_url else '?'
     # Include both snake_case and camelCase query keys for compatibility.
@@ -4847,7 +4860,7 @@ def api_verify():
     validates the wallet, saves it, and sends the confirmation (plus an invite
     link) to the user via the Telegram bot.
 
-    External websites (e.g. token-gate-bot-production.up.railway.app/verify) can also call this endpoint
+    External websites (e.g. token-gate-bot-production.up.railway.app/api/verify) can also call this endpoint
     directly from their server or browser after a successful wallet verification,
     without needing the user to manually run /register in Telegram.  To bypass
     the on-chain requirement check and trust the website's own verification,
