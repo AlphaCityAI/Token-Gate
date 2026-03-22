@@ -4208,9 +4208,16 @@ def wallet_connect_webapp():
   /* ── Telegram WebApp integration ── */
   const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
   const isWebApp = !!(tg && tg.initData && tg.initData.length > 0);
+  // Detect Telegram's in-app browser (URL-button flow) vs. a real external browser.
+  // window.TelegramWebviewProxy is injected only by Telegram's native webview.
+  // tg.platform is 'unknown' / '' when the script is loaded outside Telegram.
+  const isInTelegramBrowser = !!(
+    (typeof window.TelegramWebviewProxy !== 'undefined') ||
+    (tg && tg.platform && tg.platform !== 'unknown' && tg.platform !== '')
+  );
   if (tg) {{
-    tg.ready();
-    tg.expand();
+    try {{ tg.ready(); }} catch (_) {{}}
+    try {{ tg.expand(); }} catch (_) {{}}
     // Apply Telegram theme colours when available.
     const tp = tg.themeParams || {{}};
     if (tp.bg_color) document.documentElement.style.setProperty('--bg', tp.bg_color);
@@ -4309,20 +4316,22 @@ def wallet_connect_webapp():
      ══════════════════════════════════════════════════════ */
 
   function discoverWallets() {{
-    /* The Wallet Standard specifies that wallets register themselves via
-       a global "register" event on window.  The `getWallets` helper (from
-       @wallet-standard/app) provides a snapshot + listener.  However,
-       since we are in an inline page without npm, we probe the standard
-       globals that compliant wallets inject.  */
+    /* Probe all standard mechanisms for SUI wallet detection:
+       1. Wallet Standard registry (window.__wallet_standard__) — official API;
+          the registry object exposes .get() directly, NOT via a .wallets property.
+       2. Well-known legacy window globals (suiWallet, slush, suiet, nightly …).
+       3. Phantom's SUI provider at window.phantom.sui.
+    */
     const found = [];
     try {{
-      // Method 1: Wallet Standard registry (used by Slush / Sui Wallet, Suiet, Nightly, etc.)
-      if (window.__wallet_standard__ && window.__wallet_standard__.wallets) {{
-        const reg = window.__wallet_standard__.wallets;
-        // reg may be an array or have a get() method
-        const list = typeof reg.get === 'function' ? reg.get() : (Array.isArray(reg) ? reg : []);
+      // Method 1: Wallet Standard registry
+      // The registry IS window.__wallet_standard__ — call .get() on it directly.
+      if (window.__wallet_standard__) {{
+        const reg = window.__wallet_standard__;
+        const list = typeof reg.get === 'function' ? reg.get()
+          : (reg.wallets && typeof reg.wallets.get === 'function') ? reg.wallets.get()
+          : (Array.isArray(reg.wallets) ? reg.wallets : []);
         for (const w of list) {{
-          // Only include wallets that support the SUI chain
           const chains = w.chains || [];
           const hasSui = chains.some(function(c) {{ return c.startsWith('sui:'); }});
           if (hasSui) {{
@@ -4333,12 +4342,12 @@ def wallet_connect_webapp():
 
       // Method 2: Check for well-known injected wallet objects
       const knownInjections = [
-        {{ key: 'slush',    name: 'Slush (Sui Wallet)' }},
         {{ key: 'suiWallet', name: 'Sui Wallet' }},
-        {{ key: 'suiet',    name: 'Suiet' }},
-        {{ key: 'nightly',  name: 'Nightly' }},
-        {{ key: 'martian',  name: 'Martian' }},
-        {{ key: 'ethos',    name: 'Ethos' }},
+        {{ key: 'slush',     name: 'Slush (Sui Wallet)' }},
+        {{ key: 'suiet',     name: 'Suiet' }},
+        {{ key: 'nightly',   name: 'Nightly' }},
+        {{ key: 'martian',   name: 'Martian' }},
+        {{ key: 'ethos',     name: 'Ethos' }},
       ];
       for (const inj of knownInjections) {{
         const provider = window[inj.key];
@@ -4356,6 +4365,23 @@ def wallet_connect_webapp():
               accounts: provider.accounts || [],
             }});
           }}
+        }}
+      }}
+
+      // Method 3: Phantom wallet — SUI provider lives at window.phantom.sui
+      if (window.phantom && window.phantom.sui) {{
+        const phantomSui = window.phantom.sui;
+        const isDupe = found.some(function(w) {{
+          return (w.name || '').toLowerCase().indexOf('phantom') !== -1;
+        }});
+        if (!isDupe) {{
+          found.push({{
+            name: 'Phantom',
+            icon: (phantomSui.icon || null),
+            _provider: phantomSui,
+            features: phantomSui.features || {{}},
+            accounts: phantomSui.accounts || [],
+          }});
         }}
       }}
     }} catch (e) {{
@@ -4388,11 +4414,21 @@ def wallet_connect_webapp():
         address = accounts[0].address || '';
       }}
 
+      // Fallback: Phantom / legacy wallets return a publicKey object with toSuiAddress()
+      if (!address && result && result.publicKey) {{
+        const pk = result.publicKey;
+        if (typeof pk.toSuiAddress === 'function') {{
+          address = pk.toSuiAddress();
+        }} else if (typeof pk === 'string') {{
+          address = pk;
+        }}
+      }}
+
       // Fallback: try getAccounts on the provider
       if (!address && wallet._provider && typeof wallet._provider.getAccounts === 'function') {{
         const accts = await wallet._provider.getAccounts();
         if (accts && accts.length > 0) {{
-          address = accts[0] || '';
+          address = typeof accts[0] === 'string' ? accts[0] : (accts[0].address || accts[0]);
         }}
       }}
 
@@ -4414,15 +4450,12 @@ def wallet_connect_webapp():
     $list.innerHTML = '';
 
     if (wallets.length === 0) {{
-      if (tg) {{
-        // ── Inside any Telegram browser (WebApp OR URL-button in-app browser) ──
-        // Wallet extensions (Slush, Suiet, Nightly, etc.) cannot be injected
-        // into Telegram's sandboxed browser on any platform (iOS, Android, or
-        // Desktop), whether opened as a WebApp or via a URL button.
+      if (isWebApp || isInTelegramBrowser) {{
+        // ── Inside Telegram's browser (WebApp OR URL-button in-app browser) ──
+        // Wallet extensions (Slush, Suiet, Nightly, Phantom, etc.) cannot be
+        // injected into Telegram's sandboxed browser on any platform.
         // The fix: open this same URL in the user's system browser via
-        // Telegram.WebApp.openLink(), where extensions ARE available and can
-        // connect normally.  The verification result is then POSTed to
-        // /api/verify which sends the confirmation back to the user via the bot.
+        // Telegram.WebApp.openLink(), where extensions ARE available.
         document.querySelector('#connectCard h2').textContent = '🔗 Connect Your SUI Wallet';
         document.querySelector('#connectCard > p').textContent =
           'Wallet extensions cannot run inside Telegram\'s browser. ' +
@@ -4434,7 +4467,7 @@ def wallet_connect_webapp():
         bpDiv.className = 'browser-prompt';
         bpDiv.innerHTML =
           '<div class="bp-icon">🌐</div>' +
-          '<p>Your Sui wallet extension (Slush, Suiet, Nightly, etc.) will be ' +
+          '<p>Your Sui wallet (Phantom, Slush, Suiet, Nightly, etc.) will be ' +
           'detected automatically once you open this page in your browser.</p>';
         var openBtn = document.createElement('button');
         openBtn.className = 'btn btn-browser';
@@ -4444,7 +4477,7 @@ def wallet_connect_webapp():
           var url = window.location.href;
           // tg.openLink works in both WebApp mode and Telegram's in-app browser.
           if (tg && typeof tg.openLink === 'function') {{
-            tg.openLink(url);
+            try {{ tg.openLink(url); }} catch (_) {{ window.open(url, '_blank'); }}
           }} else {{
             window.open(url, '_blank');
           }}
@@ -4452,17 +4485,16 @@ def wallet_connect_webapp():
         bpDiv.appendChild(openBtn);
         $list.appendChild(bpDiv);
 
-        // Manual entry as secondary fallback — keep toggle visible but relabelled
+        // Manual entry as secondary fallback
         document.getElementById('manualToggleBtn').textContent =
           'No wallet app? Enter address manually ▾';
       }} else {{
-        // ── In external browser (or standalone) ────────────────────────────
-        // No wallet extension detected.  Offer a system-browser link as a
-        // fallback for users on desktop Telegram's in-app browser, then fall
-        // back to manual address entry.
+        // ── In a real external browser ──
+        // No SUI wallet extension detected.  Prompt the user to install one
+        // or fall back to manual address entry.
         document.querySelector('#connectCard h2').textContent = '📝 Enter Your SUI Wallet Address';
         document.querySelector('#connectCard > p').textContent =
-          'No wallet extension detected. Install a SUI wallet (Slush, Suiet, Nightly, etc.) ' +
+          'No SUI wallet extension detected. Install Phantom, Slush, Suiet, or Nightly — ' +
           'or enter your address manually below.';
         document.getElementById('manualEntry').classList.add('show');
         document.getElementById('manualToggle').style.display = 'none';
@@ -4538,35 +4570,49 @@ def wallet_connect_webapp():
 
   /* ── Start wallet detection ── */
   function initWalletDiscovery() {{
-    // A brief delay (100 ms) lets wallet extensions complete their synchronous
-    // injection into window.__wallet_standard__ / window.<name> before we
-    // probe.  Extensions inject during script initialisation (well before
-    // DOMContentLoaded), so 100 ms is plenty even on slow devices.
-    // The Wallet Standard 'register' listener below also catches any
-    // late-registering wallets that arrive after the timeout.
-    setTimeout(function() {{
+    var scanDone = false;
+
+    function doScan() {{
+      if (scanDone) return;
+      scanDone = true;
       const wallets = discoverWallets();
       renderWalletList(wallets);
 
-      // In a true external browser (not any Telegram browser context),
-      // auto-trigger the connection popup when exactly one wallet is detected
-      // so the user sees the sign-in prompt immediately without an extra click.
-      if (!tg && wallets.length === 1) {{
+      // In a real external browser (not any Telegram context), auto-trigger the
+      // connection popup when exactly one wallet is detected so the user sees
+      // the sign-in prompt immediately without an extra click.
+      if (!isWebApp && !isInTelegramBrowser && wallets.length === 1) {{
         var firstItem = document.querySelector('#walletList .wallet-item');
         if (firstItem) firstItem.click();
       }}
 
-      // Also listen for late-registering wallets (Wallet Standard event)
-      if (window.__wallet_standard__ && window.__wallet_standard__.wallets) {{
-        const reg = window.__wallet_standard__.wallets;
-        if (typeof reg.on === 'function') {{
-          reg.on('register', function() {{
-            const updated = discoverWallets();
-            renderWalletList(updated);
-          }});
-        }}
+      // Also listen for late-registering wallets via the Wallet Standard registry.
+      // The registry lives directly on window.__wallet_standard__ (no .wallets sub-key).
+      if (window.__wallet_standard__ && typeof window.__wallet_standard__.on === 'function') {{
+        window.__wallet_standard__.on('register', function() {{
+          const updated = discoverWallets();
+          renderWalletList(updated);
+        }});
       }}
-    }}, 100);
+    }}
+
+    // 300 ms lets most wallet extensions finish their synchronous injection.
+    var scanTimer = setTimeout(doScan, 300);
+
+    // Failsafe: always show UI after 3 s — prevents infinite "Detecting wallets…"
+    // spin if an extension stalls or the environment is unusual.
+    setTimeout(function() {{
+      if (!scanDone) {{
+        doScan();
+      }}
+    }}, 3000);
+
+    // Some wallets fire a custom event when they register.  Listen early so we
+    // can kick off the scan immediately instead of waiting for the 300 ms timer.
+    window.addEventListener('wallet-standard:register-wallet', function() {{
+      clearTimeout(scanTimer);
+      scanTimer = setTimeout(doScan, 50);
+    }}, {{ once: true }});
   }}
 
   initWalletDiscovery();
