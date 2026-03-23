@@ -4405,39 +4405,38 @@ def wallet_connect_webapp():
   /* ── SUI wallet sign-in: ask wallet to sign a message to prove ownership ── */
   async function signWalletOwnership(wallet, account, address) {{
     // Try standard SUI personal-message signing.
-    // Feature names to try in priority order:
+    // 'sui:signPersonalMessage' is the current standard; 'standard:signMessage' is the
+    // legacy name used by older wallet implementations.
     const signFeatureKeys = [
-      'sui:signPersonalMessage',  // current standard
-      'standard:signMessage',     // legacy name
+      'sui:signPersonalMessage',
+      'standard:signMessage',
     ];
+    const signMsg = 'Token Gate: verify wallet ownership for address ' + address;
     for (const key of signFeatureKeys) {{
       const feat = wallet.features && wallet.features[key];
       if (!feat) continue;
       const signFn = (feat.signPersonalMessage || feat.signMessage);
       if (typeof signFn !== 'function') continue;
-      const message = 'Token Gate: verify wallet ownership for address ' + address;
-      const messageBytes = new TextEncoder().encode(message);
       try {{
+        const messageBytes = new TextEncoder().encode(signMsg);
         const input = account
           ? {{ message: messageBytes, account: account }}
           : {{ message: messageBytes }};
         const sigResult = await signFn.call(feat, input);
         // sigResult.signature is base64-encoded; bytes may also be present
         const sig = sigResult && (sigResult.signature || sigResult.bytes);
-        if (sig) return {{ signature: sig, message: message }};
+        if (sig) return {{ signature: sig, message: signMsg }};
       }} catch (e) {{
-        // If signing is rejected or unsupported, fall through without a signature.
+        // Feature exists but signing failed (e.g. user rejected) — try next key.
       }}
-      break;
     }}
     // Legacy _provider.signMessage fallback (e.g. older Phantom)
     if (wallet._provider && typeof wallet._provider.signMessage === 'function') {{
       try {{
-        const message = 'Token Gate: verify wallet ownership for address ' + address;
-        const messageBytes = new TextEncoder().encode(message);
+        const messageBytes = new TextEncoder().encode(signMsg);
         const sigResult = await wallet._provider.signMessage({{ message: messageBytes }});
         const sig = sigResult && (sigResult.signature || sigResult.bytes);
-        if (sig) return {{ signature: sig, message: message }};
+        if (sig) return {{ signature: sig, message: signMsg }};
       }} catch (e) {{}}
     }}
     return null;
