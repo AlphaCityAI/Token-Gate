@@ -3974,44 +3974,7 @@ def wallet_connect_webapp():
       color: var(--green-text); word-break: break-all;
     }}
 
-    /* ── Manual entry toggle ── */
-    .manual-toggle {{
-      text-align: center; margin-top: 12px;
-    }}
-    .manual-toggle button {{
-      background: none; border: none; color: var(--muted); font-size: 12px;
-      cursor: pointer; text-decoration: underline; padding: 4px;
-    }}
-    .manual-toggle button:hover {{ color: var(--text); }}
-    .manual-entry {{ display: none; margin-top: 12px; }}
-    .manual-entry.show {{ display: block; }}
 
-    /* ── Wallet input (manual fallback) ── */
-    .input-group {{
-      position: relative;
-    }}
-    .input-group input {{
-      width: 100%; padding: 14px 52px 14px 14px;
-      border-radius: 10px; border: 1px solid var(--border);
-      background: var(--bg); color: var(--text);
-      font-size: 14px; font-family: 'SF Mono', 'Fira Code', monospace;
-      outline: none; transition: border-color .2s;
-    }}
-    .input-group input:focus {{ border-color: var(--blue); }}
-    .input-group input::placeholder {{ color: #475569; }}
-    .paste-btn {{
-      position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
-      background: var(--card); border: 1px solid var(--border);
-      color: var(--muted); border-radius: 6px; padding: 6px 10px;
-      font-size: 12px; cursor: pointer; font-weight: 600;
-      transition: all .2s;
-    }}
-    .paste-btn:hover {{ color: var(--text); border-color: var(--text); }}
-    .input-hint {{
-      font-size: 11px; color: var(--muted); margin-top: 6px; padding-left: 2px;
-    }}
-    .input-valid {{ color: var(--green) !important; }}
-    .input-invalid {{ color: var(--red) !important; }}
 
     /* ── Primary button ── */
     .btn {{
@@ -4137,14 +4100,21 @@ def wallet_connect_webapp():
     <div class="card" id="connectCard">
       <h2>🔗 Connect Your SUI Wallet</h2>
       <p style="color:var(--muted); font-size:13px; margin-bottom:14px;">
-        Choose a wallet below to sign in. Your address will be detected automatically.
+        Click the button below to connect your wallet and verify your holdings.
       </p>
 
-      <!-- Detected wallets will be rendered here -->
-      <div id="walletList" class="wallet-list"></div>
+      <!-- Primary connect CTA (shown before wallet selection begins) -->
+      <div id="connectBtnWrapper">
+        <button class="btn btn-primary" id="connectWalletBtn">
+          🔗 Click to Verify Wallet Holdings
+        </button>
+      </div>
+
+      <!-- Detected wallets will be rendered here (shown after scan) -->
+      <div id="walletList" class="wallet-list" style="display:none;"></div>
 
       <!-- Scanning indicator (shown while detecting wallets) -->
-      <div id="walletScanning" class="scanning">
+      <div id="walletScanning" class="scanning" style="display:none;">
         <div class="spinner"></div>
         <p style="color:var(--muted); font-size:12px; margin-top:8px;">Detecting wallets…</p>
       </div>
@@ -4162,19 +4132,6 @@ def wallet_connect_webapp():
         Verify On-Chain
       </button>
       <div class="alert" id="walletAlert"></div>
-
-      <!-- Manual entry fallback (collapsed by default) -->
-      <div class="manual-toggle" id="manualToggle">
-        <button id="manualToggleBtn">No wallet extension? Enter address manually ▾</button>
-      </div>
-      <div class="manual-entry" id="manualEntry">
-        <div class="input-group">
-          <input id="wallet" type="text" placeholder="0x..." autocomplete="off"
-                 spellcheck="false" autocapitalize="none" />
-          <button class="paste-btn" id="pasteBtn">📋 Paste</button>
-        </div>
-        <div class="input-hint" id="inputHint">Paste or type your SUI wallet address (0x…)</div>
-      </div>
     </div>
   </div>
 
@@ -4245,10 +4202,7 @@ def wallet_connect_webapp():
   let connectedAddress = '';
 
   /* ── DOM refs ── */
-  const $wallet      = document.getElementById('wallet');
-  const $pasteBtn    = document.getElementById('pasteBtn');
   const $verifyBtn   = document.getElementById('verifyBtn');
-  const $hint        = document.getElementById('inputHint');
   const $walletAlert = document.getElementById('walletAlert');
 
   /* ── Render requirements panel ── */
@@ -4303,8 +4257,6 @@ def wallet_connect_webapp():
       $cw.style.display = 'flex';
       $verifyBtn.disabled = false;
       $verifyBtn.textContent = 'Verify On-Chain';
-      // Hide the manual entry if wallet was connected via extension
-      document.getElementById('manualEntry').classList.remove('show');
     }} else {{
       $cw.style.display = 'none';
       $verifyBtn.disabled = true;
@@ -4385,7 +4337,7 @@ def wallet_connect_webapp():
         }}
       }}
     }} catch (e) {{
-      // Wallet detection failed silently — manual fallback will be shown.
+      // Wallet detection failed silently — no wallet extension found.
     }}
     return found;
   }}
@@ -4447,6 +4399,7 @@ def wallet_connect_webapp():
     const $list = document.getElementById('walletList');
     const $scanning = document.getElementById('walletScanning');
     $scanning.style.display = 'none';
+    $list.style.display = '';
     $list.innerHTML = '';
 
     if (wallets.length === 0) {{
@@ -4484,20 +4437,32 @@ def wallet_connect_webapp():
         }});
         bpDiv.appendChild(openBtn);
         $list.appendChild(bpDiv);
-
-        // Manual entry as secondary fallback
-        document.getElementById('manualToggleBtn').textContent =
-          'No wallet app? Enter address manually ▾';
       }} else {{
         // ── In a real external browser ──
-        // No SUI wallet extension detected.  Prompt the user to install one
-        // or fall back to manual address entry.
-        document.querySelector('#connectCard h2').textContent = '📝 Enter Your SUI Wallet Address';
+        // No SUI wallet extension detected.  Prompt the user to install one.
+        document.querySelector('#connectCard h2').textContent = '👛 No Wallet Detected';
         document.querySelector('#connectCard > p').textContent =
-          'No SUI wallet extension detected. Install Phantom, Slush, Suiet, or Nightly — ' +
-          'or enter your address manually below.';
-        document.getElementById('manualEntry').classList.add('show');
-        document.getElementById('manualToggle').style.display = 'none';
+          'No SUI wallet extension was detected. Please install a supported ' +
+          'wallet (Phantom, Slush, Suiet, or Nightly) and reload this page.';
+
+        const installDiv = document.createElement('div');
+        installDiv.className = 'browser-prompt';
+        installDiv.innerHTML =
+          '<div class="bp-icon">🛠️</div>' +
+          '<p>Install one of the following browser extensions, then click <strong>Retry</strong> to continue:</p>';
+        const retryBtn = document.createElement('button');
+        retryBtn.className = 'btn btn-browser';
+        retryBtn.style.marginTop = '0';
+        retryBtn.textContent = '🔄 Retry Wallet Detection';
+        retryBtn.addEventListener('click', function() {{
+          $list.innerHTML = '';
+          $list.style.display = 'none';
+          document.getElementById('walletScanning').style.display = '';
+          const wallets2 = discoverWallets();
+          renderWalletList(wallets2);
+        }});
+        installDiv.appendChild(retryBtn);
+        $list.appendChild(installDiv);
       }}
       return;
     }}
@@ -4560,7 +4525,7 @@ def wallet_connect_webapp():
           arrow.textContent = '→';
           allItems.forEach(function(item) {{ item.style.pointerEvents = ''; item.style.opacity = ''; }});
           // Show error
-          showAlert('walletAlert', 'Could not connect to ' + (w.name || 'wallet') + '. Try another wallet or enter your address manually.', 'error');
+          showAlert('walletAlert', 'Could not connect to ' + (w.name || 'wallet') + '. Please try another wallet or install a supported Sui wallet extension.', 'error');
         }}
       }});
 
@@ -4577,14 +4542,6 @@ def wallet_connect_webapp():
       scanDone = true;
       const wallets = discoverWallets();
       renderWalletList(wallets);
-
-      // In a real external browser (not any Telegram context), auto-trigger the
-      // connection popup when exactly one wallet is detected so the user sees
-      // the sign-in prompt immediately without an extra click.
-      if (!isWebApp && !isInTelegramBrowser && wallets.length === 1) {{
-        var firstItem = document.querySelector('#walletList .wallet-item');
-        if (firstItem) firstItem.click();
-      }}
 
       // Also listen for late-registering wallets via the Wallet Standard registry.
       // The registry lives directly on window.__wallet_standard__ (no .wallets sub-key).
@@ -4615,61 +4572,11 @@ def wallet_connect_webapp():
     }}, {{ once: true }});
   }}
 
-  initWalletDiscovery();
-
-  /* ── Manual entry toggle ── */
-  document.getElementById('manualToggleBtn').addEventListener('click', function() {{
-    const $me = document.getElementById('manualEntry');
-    const isVisible = $me.classList.contains('show');
-    if (isVisible) {{
-      $me.classList.remove('show');
-      // Restore the button text that was set when the toggle was last shown
-      // (may have been customised by renderWalletList for the Telegram case).
-      this.textContent = this.dataset.collapseText || 'No wallet extension? Enter address manually ▾';
-    }} else {{
-      // Remember the current collapsed-state label so we can restore it.
-      if (!this.dataset.collapseText) {{
-        this.dataset.collapseText = this.textContent;
-      }}
-      $me.classList.add('show');
-      this.textContent = 'Hide manual entry ▴';
-      $wallet.focus();
-    }}
-  }});
-
-  /* ── Manual wallet input validation ── */
-  $wallet.addEventListener('input', function() {{
-    const v = $wallet.value.trim();
-    if (!v) {{
-      $hint.textContent = 'Paste or type your SUI wallet address (0x…)';
-      $hint.className = 'input-hint';
-      if (!connectedAddress) $verifyBtn.disabled = true;
-    }} else if (isValidSuiAddress(v)) {{
-      $hint.textContent = '✓ Valid SUI address';
-      $hint.className = 'input-hint input-valid';
-      $verifyBtn.disabled = false;
-      // Use the manually-entered address
-      connectedAddress = v;
-    }} else {{
-      $hint.textContent = '✗ Invalid format — must be 0x followed by 40-64 hex characters';
-      $hint.className = 'input-hint input-invalid';
-      if (!connectedAddress) $verifyBtn.disabled = true;
-    }}
-  }});
-
-  /* ── Paste button ── */
-  $pasteBtn.addEventListener('click', async function() {{
-    try {{
-      const text = await navigator.clipboard.readText();
-      if (text) {{
-        $wallet.value = text.trim();
-        $wallet.dispatchEvent(new Event('input'));
-      }}
-    }} catch (_) {{
-      $pasteBtn.textContent = '⌨️ Type';
-      $pasteBtn.title = 'Clipboard not available — please type your address manually';
-      $pasteBtn.disabled = true;
-    }}
+  /* ── Connect button: triggers wallet discovery on explicit user action ── */
+  document.getElementById('connectWalletBtn').addEventListener('click', function() {{
+    document.getElementById('connectBtnWrapper').style.display = 'none';
+    document.getElementById('walletScanning').style.display = '';
+    initWalletDiscovery();
   }});
 
   /* ── Alert helper ── */
@@ -4829,7 +4736,7 @@ def wallet_connect_webapp():
 
   /* ── Main verification flow ── */
   async function startVerification() {{
-    const wallet = connectedAddress || $wallet.value.trim();
+    const wallet = connectedAddress;
     if (!isValidSuiAddress(wallet)) return;
 
     $verifyBtn.disabled = true;
@@ -4885,7 +4792,7 @@ def wallet_connect_webapp():
     }}
   }}
 
-  /* ── Submit handler (manual verify button click) ── */
+  /* ── Submit handler (verify button click) ── */
   $verifyBtn.addEventListener('click', function() {{
     startVerification();
   }});
