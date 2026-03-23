@@ -4054,7 +4054,7 @@ def wallet_connect_webapp():
     .section.active {{ display: block; }}
 
     /* ── Fade-in animation ── */
-    @keyframes fadeIn {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+    @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: none; }} }}
     .section.active {{ animation: fadeIn .3s ease; }}
 
     /* ── Scanning animation ── */
@@ -4200,7 +4200,6 @@ def wallet_connect_webapp():
 
   /* ── State ── */
   let connectedAddress = '';
-  let walletSignResult = null;  // { signature, message } from signWalletOwnership, or null
 
   /* ── DOM refs ── */
   const $verifyBtn   = document.getElementById('verifyBtn');
@@ -4249,9 +4248,8 @@ def wallet_connect_webapp():
   }}
 
   /* ── Update connected state ── */
-  function setConnectedWallet(addr, signRes) {{
+  function setConnectedWallet(addr) {{
     connectedAddress = addr;
-    walletSignResult = signRes || null;
     const $cw = document.getElementById('connectedWallet');
     const $ca = document.getElementById('connectedAddr');
     if (addr) {{
@@ -4346,13 +4344,9 @@ def wallet_connect_webapp():
 
   async function connectToWallet(wallet) {{
     try {{
-      // Standard connect feature.  Bind `this` to the feature object so
-      // wallet implementations that reference `this` internally work correctly.
-      const connectFeature = wallet.features && wallet.features['standard:connect'];
-      const connectFn = connectFeature
-        ? (typeof connectFeature.connect === 'function'
-            ? connectFeature.connect.bind(connectFeature)
-            : null)
+      // Standard connect feature
+      const connectFn = wallet.features && wallet.features['standard:connect']
+        ? wallet.features['standard:connect'].connect
         : (wallet._provider && typeof wallet._provider.connect === 'function')
           ? wallet._provider.connect.bind(wallet._provider)
           : null;
@@ -4365,13 +4359,11 @@ def wallet_connect_webapp():
 
       // Extract address from the connected accounts
       let address = '';
-      let connectedAccount = null;
       const accounts = result && result.accounts ? result.accounts
         : (wallet.accounts && wallet.accounts.length > 0 ? wallet.accounts : []);
 
       if (accounts.length > 0) {{
-        connectedAccount = accounts[0];
-        address = connectedAccount.address || '';
+        address = accounts[0].address || '';
       }}
 
       // Fallback: Phantom / legacy wallets return a publicKey object with toSuiAddress()
@@ -4396,50 +4388,10 @@ def wallet_connect_webapp():
         throw new Error('No valid SUI address returned from wallet');
       }}
 
-      return {{ address: address, account: connectedAccount, wallet: wallet }};
+      return address;
     }} catch (e) {{
       throw e;
     }}
-  }}
-
-  /* ── SUI wallet sign-in: ask wallet to sign a message to prove ownership ── */
-  async function signWalletOwnership(wallet, account, address) {{
-    // Try standard SUI personal-message signing.
-    // 'sui:signPersonalMessage' is the current standard; 'standard:signMessage' is the
-    // legacy name used by older wallet implementations.
-    const signFeatureKeys = [
-      'sui:signPersonalMessage',
-      'standard:signMessage',
-    ];
-    const signMsg = 'Token Gate: verify wallet ownership for address ' + address;
-    for (const key of signFeatureKeys) {{
-      const feat = wallet.features && wallet.features[key];
-      if (!feat) continue;
-      const signFn = (feat.signPersonalMessage || feat.signMessage);
-      if (typeof signFn !== 'function') continue;
-      try {{
-        const messageBytes = new TextEncoder().encode(signMsg);
-        const input = account
-          ? {{ message: messageBytes, account: account }}
-          : {{ message: messageBytes }};
-        const sigResult = await signFn.call(feat, input);
-        // sigResult.signature is base64-encoded; bytes may also be present
-        const sig = sigResult && (sigResult.signature || sigResult.bytes);
-        if (sig) return {{ signature: sig, message: signMsg }};
-      }} catch (e) {{
-        // Feature exists but signing failed (e.g. user rejected) — try next key.
-      }}
-    }}
-    // Legacy _provider.signMessage fallback (e.g. older Phantom)
-    if (wallet._provider && typeof wallet._provider.signMessage === 'function') {{
-      try {{
-        const messageBytes = new TextEncoder().encode(signMsg);
-        const sigResult = await wallet._provider.signMessage({{ message: messageBytes }});
-        const sig = sigResult && (sigResult.signature || sigResult.bytes);
-        if (sig) return {{ signature: sig, message: signMsg }};
-      }} catch (e) {{}}
-    }}
-    return null;
   }}
 
   /* ── Render detected wallets ── */
@@ -4552,7 +4504,7 @@ def wallet_connect_webapp():
       arrow.textContent = '→';
       el.appendChild(arrow);
 
-      // Click handler: connect to this wallet then request a sign-in signature
+      // Click handler: connect to this wallet
       el.addEventListener('click', async function() {{
         // Disable all wallet items while connecting
         const allItems = $list.querySelectorAll('.wallet-item');
@@ -4561,15 +4513,8 @@ def wallet_connect_webapp():
         arrow.innerHTML = '<span class="spinner"></span>';
 
         try {{
-          const {{ address, account, wallet: connectedWallet }} = await connectToWallet(w);
-
-          // Ask the wallet to sign a message — this is the "SUI wallet sign-in" step.
-          // It proves the user actually controls the address (not just knows it).
-          hintEl.textContent = 'Sign to verify ownership…';
-          const signResult = await signWalletOwnership(connectedWallet, account, address);
-          // signResult may be null if the wallet doesn't support signing; we still proceed.
-
-          setConnectedWallet(address, signResult);
+          const address = await connectToWallet(w);
+          setConnectedWallet(address);
           el.classList.add('connected');
           hintEl.textContent = 'Connected ✓';
           arrow.textContent = '✓';
@@ -4809,8 +4754,6 @@ def wallet_connect_webapp():
     const passed = showResult(wallet, check);
 
     // Build payload to send back to the bot.
-    // Include the wallet sign-in signature when available so the server can
-    // optionally verify the user actually controls the claimed address.
     const payload = {{
       wallet_address: wallet,
       group_id: GROUP_ID,
@@ -4819,9 +4762,7 @@ def wallet_connect_webapp():
       token_type: TOKEN_TYPE,
       required_balance: REQUIRED_BAL,
       token_balance: check.tokenBalance,
-      nft_count: check.nftCount,
-      wallet_signature: walletSignResult ? walletSignResult.signature : null,
-      sign_message: walletSignResult ? walletSignResult.message : null
+      nft_count: check.nftCount
     }};
 
     if (isWebApp) {{
