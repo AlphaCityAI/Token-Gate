@@ -4289,7 +4289,7 @@ def wallet_connect_webapp():
   }}
 
   function _getRegisteredWallets() {{
-    if (!_walletListCache) _walletListCache = [].concat(Array.from(_registeredWallets));
+    if (!_walletListCache) _walletListCache = Array.from(_registeredWallets);
     return _walletListCache;
   }}
 
@@ -4690,14 +4690,15 @@ def wallet_connect_webapp():
     }}
 
     // Give wallet extensions time to inject and register.  Multiple passes
-    // ensure we catch both fast and slow wallets.
+    // ensure we catch both fast and slow wallets.  We only proceed early if
+    // wallets are actually found; otherwise the 3 s failsafe handles it.
+    function tryEarlyScan() {{
+      if (scanDone) return;
+      if (discoverWallets().length > 0) doScan();
+    }}
     var scanTimers = [
-      setTimeout(function() {{
-        if (!scanDone && discoverWallets().length > 0) doScan();
-      }}, 300),
-      setTimeout(function() {{
-        if (!scanDone && discoverWallets().length > 0) doScan();
-      }}, 800)
+      setTimeout(tryEarlyScan, 300),
+      setTimeout(tryEarlyScan, 800)
     ];
 
     // Failsafe: always show UI after 3 s — prevents infinite "Detecting wallets…"
