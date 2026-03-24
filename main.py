@@ -2499,48 +2499,35 @@ def calculate_user_vote_weight(group_id, user_id):
         logging.error(f"Error calculating vote weight for user {user_id}: {e}")
         return 0
 
-_UUID_RE = re.compile(
-    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-)
-
-
 def _normalize_collection_id(raw_id: str) -> str:
     """Normalise a collection identifier to a canonical on-chain form.
 
     Accepted inputs
     ---------------
-    * Full SUI type string   ``0xPACKAGE::module::Struct``  → returned as-is
-    * SUI hex address         ``0xABCD…``                   → returned as-is
-    * UUID (marketplace ID)   ``2dee0596-…-d40da2991c22``   → converted to
-      ``0x`` + zero-padded 64-char hex (best-effort package address)
+    * Full SUI type string   ``0xPACKAGE::module::Struct``  → address portion
+      lowercased / zero-padded for canonical SUI RPC matching.
+    * SUI hex address         ``0xABCD…``                   → lowercased,
+      zero-padded to 64 hex characters.
     """
     cid = (raw_id or "").strip()
     if not cid:
         return ""
 
-    # Full type string – keep as-is
+    # Full type string – normalise the address portion (before first ::)
     if "::" in cid:
-        return cid
+        addr_part, rest = cid.split("::", 1)
+        addr_part = addr_part.strip()
+        if addr_part.startswith("0x") or addr_part.startswith("0X"):
+            hex_part = addr_part[2:]
+            if hex_part and all(c in "0123456789abcdefABCDEF" for c in hex_part):
+                addr_part = "0x" + hex_part.lower().zfill(64)
+        return addr_part + "::" + rest
 
-    # Already a 0x hex address
+    # Plain hex address
     if cid.startswith("0x") or cid.startswith("0X"):
         hex_part = cid[2:]
         if hex_part and all(c in "0123456789abcdefABCDEF" for c in hex_part):
             return "0x" + hex_part.lower().zfill(64)
-
-    # UUID → strip dashes, zero-pad to 64 hex chars
-    if _UUID_RE.match(cid):
-        hex_part = cid.replace("-", "").lower()
-        padded = hex_part.zfill(64)
-        logging.warning(
-            "Collection ID looks like a marketplace UUID (%s), not a SUI "
-            "package address. Converting to 0x%s as a best-effort attempt, "
-            "but this is unlikely to match on-chain objects. For reliable "
-            "NFT verification, use the on-chain package address (0x…) or "
-            "full type string (0x…::module::Struct) from a block explorer.",
-            cid, padded,
-        )
-        return "0x" + padded
 
     # Fallback: return as-is (will be used for substring matching)
     return cid
@@ -4303,10 +4290,11 @@ def wallet_connect_webapp():
       <!-- Connected wallet indicator (hidden initially) -->
       <div id="connectedWallet" class="connected-wallet" style="display:none;">
         <span class="cw-icon">✅</span>
-        <div>
+        <div style="flex:1;">
           <div style="font-weight:600; font-size:13px; color:var(--green-text);">Wallet Connected</div>
           <div class="cw-addr" id="connectedAddr"></div>
         </div>
+        <a href="#" id="changeWalletBtn" style="font-size:12px; color:var(--blue); text-decoration:none; white-space:nowrap;">Change ↻</a>
       </div>
 
       <button class="btn btn-primary" id="verifyBtn" disabled>
@@ -4382,6 +4370,7 @@ def wallet_connect_webapp():
   /* ── State ── */
   let connectedAddress = '';
   let walletSignResult = null;  // {{ signature, message }} from signWalletOwnership, or null
+  let _lastConnectedWallet = null;  // wallet object for disconnect
 
   /* ── DOM refs ── */
   const $verifyBtn   = document.getElementById('verifyBtn');
@@ -4430,9 +4419,10 @@ def wallet_connect_webapp():
   }}
 
   /* ── Update connected state ── */
-  function setConnectedWallet(addr, signRes) {{
+  function setConnectedWallet(addr, signRes, walletObj) {{
     connectedAddress = addr;
     walletSignResult = signRes || null;
+    _lastConnectedWallet = walletObj || null;
     const $cw = document.getElementById('connectedWallet');
     const $ca = document.getElementById('connectedAddr');
     if (addr) {{
@@ -4817,7 +4807,7 @@ def wallet_connect_webapp():
           const signResult = await signWalletOwnership(connectedWallet, account, address);
           // signResult may be null if the wallet doesn't support signing; we still proceed.
 
-          setConnectedWallet(address, signResult);
+          setConnectedWallet(address, signResult, w);
           el.classList.add('connected');
           hintEl.textContent = 'Connected ✓';
           arrow.textContent = '✓';
@@ -4929,6 +4919,50 @@ def wallet_connect_webapp():
       else l.classList.remove('done');
     }}
   }}
+
+  /* ── Change wallet: disconnect and return to wallet selection ── */
+  async function changeWallet() {{
+    // Try to disconnect the current wallet via standard:disconnect
+    if (_lastConnectedWallet) {{
+      try {{
+        const feat = _lastConnectedWallet.features &&
+                     _lastConnectedWallet.features['standard:disconnect'];
+        if (feat && typeof feat.disconnect === 'function') {{
+          await feat.disconnect.call(feat);
+        }} else if (_lastConnectedWallet._provider &&
+                   typeof _lastConnectedWallet._provider.disconnect === 'function') {{
+          await _lastConnectedWallet._provider.disconnect();
+        }}
+      }} catch (_) {{}}
+    }}
+    // Reset connection state
+    setConnectedWallet('', null, null);
+    // Reset wallet list items (remove 'connected' class, re-enable clicks)
+    const $list = document.getElementById('walletList');
+    const allItems = $list.querySelectorAll('.wallet-item');
+    allItems.forEach(function(item) {{
+      item.classList.remove('connected');
+      item.style.pointerEvents = '';
+      item.style.opacity = '';
+      // Reset hint/arrow text for all wallet items
+      const hint = item.querySelector('.w-hint');
+      const arrow = item.querySelector('.w-arrow');
+      if (hint) hint.textContent = 'Click to connect';
+      if (arrow) arrow.textContent = '→';
+    }});
+    // Show wallet list, hide scanning, hide connect button wrapper
+    $list.style.display = '';
+    document.getElementById('walletScanning').style.display = 'none';
+    document.getElementById('connectBtnWrapper').style.display = 'none';
+    // Go back to wallet selection step
+    goToSection(1);
+    document.getElementById('walletAlert').className = 'alert';
+  }}
+
+  document.getElementById('changeWalletBtn').addEventListener('click', function(e) {{
+    e.preventDefault();
+    changeWallet();
+  }});
 
   /* ── SUI RPC helper ── */
   async function suiRpc(method, params) {{
