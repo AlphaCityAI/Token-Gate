@@ -4200,7 +4200,7 @@ def wallet_connect_webapp():
 
   /* ── State ── */
   let connectedAddress = '';
-  let walletSignResult = null;  // { signature, message } from signWalletOwnership, or null
+  let walletSignResult = null;  // {{ signature, message }} from signWalletOwnership, or null
 
   /* ── DOM refs ── */
   const $verifyBtn   = document.getElementById('verifyBtn');
