@@ -4070,7 +4070,7 @@ def wallet_connect_webapp():
   <div class="header">
     <div class="logo">🔐</div>
     <h1>Wallet Verification</h1>
-    <div class="subtitle">Connect your SUI wallet to verify — right here in Telegram</div>
+    <div class="subtitle">Connect your SUI wallet to verify holdings</div>
   </div>
 
   <!-- Step indicators -->
