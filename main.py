@@ -4528,8 +4528,8 @@ def wallet_connect_webapp():
         // Telegram.WebApp.openLink(), where extensions ARE available.
         document.querySelector('#connectCard h2').textContent = '🔗 Connect Your SUI Wallet';
         document.querySelector('#connectCard > p').textContent =
-          'Wallet extensions cannot run inside Telegram\'s browser. ' +
-          'Tap the button below to open this page in your device\'s browser ' +
+          'Wallet extensions cannot run inside Telegram\\'s browser. ' +
+          'Tap the button below to open this page in your device\\'s browser ' +
           'where your Sui wallet app can connect.';
 
         // "Open in External Browser" primary CTA
@@ -4841,7 +4841,7 @@ def wallet_connect_webapp():
       $rc.innerHTML =
         '<div class="result-icon">❌</div>' +
         '<h2>Requirements Not Met</h2>' +
-        '<p>Your wallet does not currently meet the group\'s token/NFT requirements.</p>';
+        '<p>Your wallet does not currently meet the group\\'s token/NFT requirements.</p>';
     }}
 
     const $details = document.getElementById('detailsCard');
