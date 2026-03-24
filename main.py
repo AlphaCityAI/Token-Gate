@@ -2499,11 +2499,139 @@ def calculate_user_vote_weight(group_id, user_id):
         logging.error(f"Error calculating vote weight for user {user_id}: {e}")
         return 0
 
+_UUID_RE = re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+)
+
+
+def _normalize_collection_id(raw_id: str) -> str:
+    """Normalise a collection identifier to a canonical on-chain form.
+
+    Accepted inputs
+    ---------------
+    * Full SUI type string   ``0xPACKAGE::module::Struct``  → returned as-is
+    * SUI hex address         ``0xABCD…``                   → returned as-is
+    * UUID (marketplace ID)   ``2dee0596-…-d40da2991c22``   → converted to
+      ``0x`` + zero-padded 64-char hex (best-effort package address)
+    """
+    cid = (raw_id or "").strip()
+    if not cid:
+        return ""
+
+    # Full type string – keep as-is
+    if "::" in cid:
+        return cid
+
+    # Already a 0x hex address
+    if cid.startswith("0x") or cid.startswith("0X"):
+        hex_part = cid[2:]
+        if all(c in "0123456789abcdefABCDEF" for c in hex_part) and hex_part:
+            return "0x" + hex_part.lower().zfill(64)
+
+    # UUID → strip dashes, zero-pad to 64 hex chars
+    if _UUID_RE.match(cid):
+        hex_part = cid.replace("-", "").lower()
+        logging.info(
+            "Collection ID looks like a UUID (%s). "
+            "Converting to best-effort SUI address 0x%s. "
+            "For reliable results, use the on-chain package address (0x…) "
+            "or full type string (0x…::module::Struct).",
+            cid, hex_part.zfill(64),
+        )
+        return "0x" + hex_part.zfill(64)
+
+    # Fallback: return as-is (will be used for substring matching)
+    return cid
+
+
+def _build_owned_objects_query(collection_id: str, *, show_content: bool = False):
+    """Build the ``SuiObjectResponseQuery`` dict for ``suix_getOwnedObjects``.
+
+    When *collection_id* is a recognisable type or package address the query
+    includes an RPC-level ``filter`` so only matching objects are returned.
+    """
+    options = {"showType": True}
+    if show_content:
+        options["showContent"] = True
+        options["showDisplay"] = True
+
+    query: dict = {"options": options}
+
+    cid = (collection_id or "").strip()
+    if not cid:
+        return query
+
+    if "::" in cid:
+        # Full type string → use StructType filter
+        query["filter"] = {"StructType": cid}
+    elif cid.startswith("0x") and all(c in "0123456789abcdefABCDEF" for c in cid[2:]):
+        # Hex package address → use Package filter
+        query["filter"] = {"Package": cid}
+
+    return query
+
+
+def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=2):
+    """Fetch NFT objects owned by *addresses* that belong to *collection_id*.
+
+    Returns a list of object dicts (each containing at least ``type`` and
+    ``objectId``; when *show_content* is True also ``content`` / ``display``).
+    """
+    normalized = _normalize_collection_id(collection_id)
+    query = _build_owned_objects_query(normalized, show_content=show_content)
+    has_filter = "filter" in query
+
+    # Fallback client-side matching when no RPC filter is available
+    hint_lower = normalized.lower() if normalized else ""
+
+    def matches(obj):
+        otype = (obj.get("type") or "").lower()
+        oid = (obj.get("objectId") or "").lower()
+        if not otype or "::" not in otype:
+            return False
+        if "coin::" in otype:
+            return False
+        if not hint_lower:
+            return True
+        if hint_lower == oid:
+            return True
+        if otype.startswith(hint_lower + "::"):
+            return True
+        if "::" in hint_lower and otype.startswith(hint_lower):
+            return True
+        return hint_lower in otype
+
+    results = []
+    for owner in [a.lower() for a in addresses if a]:
+        cursor = None
+        while True:
+            rpc_result = sui_rpc_request(
+                "suix_getOwnedObjects",
+                [owner, query, cursor, 100],
+                max_retries=max_retries,
+            )
+            data = rpc_result.get("data", []) if rpc_result else []
+            for item in data:
+                obj = item.get("data", {})
+                if has_filter:
+                    # RPC already filtered; just skip coins/non-Move objects
+                    otype = (obj.get("type") or "").lower()
+                    if otype and "::" in otype and "coin::" not in otype:
+                        results.append(obj)
+                else:
+                    if matches(obj):
+                        results.append(obj)
+            if not rpc_result or not rpc_result.get("hasNextPage"):
+                break
+            cursor = rpc_result.get("nextCursor")
+    return results
+
+
 def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None):
     """Count NFTs for addresses via on-chain Sui owned-object queries."""
     current_time = time.time()
     normalized_addresses = [addr.lower() for addr in addresses if addr]
-    collection_hint = (collection_id or "").strip().lower()
+    collection_hint = _normalize_collection_id(collection_id).lower()
     cache_key = (tuple(sorted(normalized_addresses)), collection_hint)
 
     effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
@@ -2513,53 +2641,9 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None)
         if current_time - cache_time < effective_cache_ttl:
             return cache_result
 
-    def matches_collection(object_id: str, object_type: str) -> bool:
-        if not collection_hint:
-            return True
-        if collection_hint == object_id:
-            return True
-        if object_type.startswith(f"{collection_hint}::"):
-            return True
-        return collection_hint in object_type
-
-    total_count = 0
-
     try:
-        for owner in normalized_addresses:
-            cursor = None
-            while True:
-                result = sui_rpc_request(
-                    "suix_getOwnedObjects",
-                    [
-                        owner,
-                        {
-                            "options": {
-                                "showType": True
-                            }
-                        },
-                        cursor,
-                        100
-                    ],
-                    max_retries=2
-                )
-
-                data = result.get("data", []) if result else []
-                for item in data:
-                    obj = item.get("data", {})
-                    object_type = (obj.get("type") or "").lower()
-                    object_id = (obj.get("objectId") or "").lower()
-
-                    if not object_type or "::" not in object_type:
-                        continue
-                    if "coin::" in object_type:
-                        continue
-
-                    if matches_collection(object_id, object_type):
-                        total_count += 1
-
-                if not result or not result.get("hasNextPage"):
-                    break
-                cursor = result.get("nextCursor")
+        nfts = _fetch_owned_nfts(addresses, collection_id)
+        total_count = len(nfts)
 
         if len(nft_cache) >= MAX_CACHE_SIZE:
             sorted_keys = sorted(nft_cache.keys(), key=lambda k: nft_cache[k][0])
@@ -2577,6 +2661,99 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None)
 def check_nft_ownership(addresses, collection_id, threshold):
     total_nft_count = get_user_nft_count(addresses, collection_id)
     return total_nft_count >= threshold
+
+
+# ── NFT trait helpers (override stubs from src.nft_traits) ──────────
+
+
+def _extract_traits(obj: dict) -> dict:
+    """Extract trait key/value pairs from an NFT object's content.
+
+    Supports the most common SUI NFT attribute layouts:
+    1. ``VecMap<String, String>`` in an ``attributes`` field
+    2. Nested OriginByte-style ``attributes.fields.map.fields.contents``
+    3. Flat struct fields (anything that is a plain string value)
+    """
+    traits: dict = {}
+
+    content = obj.get("content") or {}
+    fields = content.get("fields") or {}
+
+    # Also check Display data for supplementary trait info
+    display = obj.get("display") or {}
+    display_data = display.get("data") or {}
+
+    # Strategy 1: VecMap / list-of-key-value in ``attributes``
+    attrs = fields.get("attributes") or {}
+    if isinstance(attrs, dict):
+        # Could be VecMap with .fields.contents
+        inner_fields = attrs.get("fields") or {}
+        contents = inner_fields.get("contents") or []
+        if not contents:
+            # OriginByte style: attributes -> fields -> map -> fields -> contents
+            map_field = inner_fields.get("map") or {}
+            map_inner = map_field.get("fields") or {}
+            contents = map_inner.get("contents") or []
+        for entry in contents:
+            ef = (entry.get("fields") or entry) if isinstance(entry, dict) else {}
+            key = ef.get("key") or ""
+            val = ef.get("value") or ""
+            # value might be a nested object with a ``value`` field
+            if isinstance(val, dict):
+                val = val.get("fields", {}).get("value", "") if val.get("fields") else val.get("value", "")
+            if isinstance(key, str) and isinstance(val, str) and key:
+                traits[key.lower()] = val.lower()
+
+    # Strategy 2: flat struct fields that are plain strings
+    for k, v in fields.items():
+        if k in ("id", "name", "url", "img_url", "image_url", "description", "attributes"):
+            continue
+        if isinstance(v, str):
+            traits.setdefault(k.lower(), v.lower())
+
+    # Strategy 3: Display data may contain trait-like fields
+    for k, v in display_data.items():
+        if k in ("name", "image_url", "link", "project_url", "description", "creator"):
+            continue
+        if isinstance(v, str):
+            traits.setdefault(k.lower(), v.lower())
+
+    return traits
+
+
+def get_user_nft_trait_count(wallet_addresses, collection_id, trait_name, trait_value):
+    """Count NFTs owned by *wallet_addresses* in *collection_id* whose
+    *trait_name* equals *trait_value*.  Returns ``None`` on error."""
+    try:
+        nfts = _fetch_owned_nfts(wallet_addresses, collection_id, show_content=True)
+        target_key = trait_name.strip().lower()
+        target_val = trait_value.strip().lower()
+        count = 0
+        for obj in nfts:
+            traits = _extract_traits(obj)
+            if traits.get(target_key) == target_val:
+                count += 1
+        return count
+    except Exception as e:
+        logging.error(f"Error in get_user_nft_trait_count: {e}")
+        return None
+
+
+def get_user_nft_category_count(wallet_addresses, collection_id, trait_name):
+    """Count NFTs owned by *wallet_addresses* in *collection_id* that have
+    any value for *trait_name*.  Returns ``None`` on error."""
+    try:
+        nfts = _fetch_owned_nfts(wallet_addresses, collection_id, show_content=True)
+        target_key = trait_name.strip().lower()
+        count = 0
+        for obj in nfts:
+            traits = _extract_traits(obj)
+            if target_key in traits:
+                count += 1
+        return count
+    except Exception as e:
+        logging.error(f"Error in get_user_nft_category_count: {e}")
+        return None
 
 
 def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=False):
@@ -3848,11 +4025,11 @@ def wallet_connect_webapp():
     js_reg_mode = json.dumps(safe_reg_mode)
 
     raw_nft_collection = request.args.get('nft_collection_id', '')
-    # SUI addresses are 0x followed by hex digits only.
-    nft_hex = raw_nft_collection[2:] if raw_nft_collection.startswith('0x') else raw_nft_collection
-    safe_nft_collection = re.sub(r'[^0-9a-fA-F]', '', nft_hex)
-    if safe_nft_collection:
-        safe_nft_collection = '0x' + safe_nft_collection
+    # Normalise the collection identifier so it works with both full type
+    # strings (0xPACKAGE::module::Struct) and plain hex addresses.
+    safe_nft_collection = _normalize_collection_id(raw_nft_collection)
+    # Sanitise: only allow characters valid in SUI addresses / type strings
+    safe_nft_collection = re.sub(r'[^0-9a-zA-Z_:.<>]', '', safe_nft_collection)
     js_nft_collection = json.dumps(safe_nft_collection)
 
     raw_nft_threshold = request.args.get('nft_threshold', '1')
@@ -4794,8 +4971,19 @@ def wallet_connect_webapp():
       try {{
         let count = 0;
         let cursor = null;
+        const collLower = NFT_COLLECTION.toLowerCase();
+        // Build query with server-side filter when possible
+        const baseOpts = {{ showType: true }};
+        let rpcFilter = null;
+        if (collLower.indexOf('::') !== -1) {{
+          rpcFilter = {{ StructType: NFT_COLLECTION }};
+        }} else if (/^0x[0-9a-f]+$/i.test(NFT_COLLECTION)) {{
+          rpcFilter = {{ Package: NFT_COLLECTION }};
+        }}
         do {{
-          const query = {{ options: {{ showType: true }} }};
+          const query = rpcFilter
+            ? {{ filter: rpcFilter, options: baseOpts }}
+            : {{ options: baseOpts }};
           const page = await suiRpc('suix_getOwnedObjects', [wallet, query, cursor, 50]);
           const items = page.data || [];
           for (const item of items) {{
@@ -4803,9 +4991,16 @@ def wallet_connect_webapp():
             const objType = (obj.type || '').toLowerCase();
             if (!objType || objType.indexOf('::') === -1) continue;
             if (objType.indexOf('coin::') !== -1) continue;
-            const collLower = NFT_COLLECTION.toLowerCase();
-            if (objType.startsWith(collLower + '::') || objType === collLower) {{
+            if (rpcFilter) {{
+              // RPC already filtered by collection
               count++;
+            }} else {{
+              // Client-side matching fallback
+              if (objType.startsWith(collLower + '::') ||
+                  objType === collLower ||
+                  objType.indexOf(collLower) !== -1) {{
+                count++;
+              }}
             }}
           }}
           cursor = page.hasNextPage ? page.nextCursor : null;
