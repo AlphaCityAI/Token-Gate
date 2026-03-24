@@ -2525,20 +2525,22 @@ def _normalize_collection_id(raw_id: str) -> str:
     # Already a 0x hex address
     if cid.startswith("0x") or cid.startswith("0X"):
         hex_part = cid[2:]
-        if all(c in "0123456789abcdefABCDEF" for c in hex_part) and hex_part:
+        if hex_part and all(c in "0123456789abcdefABCDEF" for c in hex_part):
             return "0x" + hex_part.lower().zfill(64)
 
     # UUID → strip dashes, zero-pad to 64 hex chars
     if _UUID_RE.match(cid):
         hex_part = cid.replace("-", "").lower()
-        logging.info(
-            "Collection ID looks like a UUID (%s). "
-            "Converting to best-effort SUI address 0x%s. "
-            "For reliable results, use the on-chain package address (0x…) "
-            "or full type string (0x…::module::Struct).",
-            cid, hex_part.zfill(64),
+        padded = hex_part.zfill(64)
+        logging.warning(
+            "Collection ID looks like a marketplace UUID (%s), not a SUI "
+            "package address. Converting to 0x%s as a best-effort attempt, "
+            "but this is unlikely to match on-chain objects. For reliable "
+            "NFT verification, use the on-chain package address (0x…) or "
+            "full type string (0x…::module::Struct) from a block explorer.",
+            cid, padded,
         )
-        return "0x" + hex_part.zfill(64)
+        return "0x" + padded
 
     # Fallback: return as-is (will be used for substring matching)
     return cid
@@ -2564,7 +2566,7 @@ def _build_owned_objects_query(collection_id: str, *, show_content: bool = False
     if "::" in cid:
         # Full type string → use StructType filter
         query["filter"] = {"StructType": cid}
-    elif cid.startswith("0x") and all(c in "0123456789abcdefABCDEF" for c in cid[2:]):
+    elif cid.startswith("0x") and len(cid) > 2 and all(c in "0123456789abcdefABCDEF" for c in cid[2:]):
         # Hex package address → use Package filter
         query["filter"] = {"Package": cid}
 
@@ -2642,7 +2644,7 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None)
             return cache_result
 
     try:
-        nfts = _fetch_owned_nfts(addresses, collection_id)
+        nfts = _fetch_owned_nfts(normalized_addresses, collection_id)
         total_count = len(nfts)
 
         if len(nft_cache) >= MAX_CACHE_SIZE:
@@ -2700,7 +2702,7 @@ def _extract_traits(obj: dict) -> dict:
             val = ef.get("value") or ""
             # value might be a nested object with a ``value`` field
             if isinstance(val, dict):
-                val = val.get("fields", {}).get("value", "") if val.get("fields") else val.get("value", "")
+                val = (val.get("fields") or {}).get("value", "") or val.get("value", "")
             if isinstance(key, str) and isinstance(val, str) and key:
                 traits[key.lower()] = val.lower()
 
@@ -4029,7 +4031,7 @@ def wallet_connect_webapp():
     # strings (0xPACKAGE::module::Struct) and plain hex addresses.
     safe_nft_collection = _normalize_collection_id(raw_nft_collection)
     # Sanitise: only allow characters valid in SUI addresses / type strings
-    safe_nft_collection = re.sub(r'[^0-9a-zA-Z_:.<>]', '', safe_nft_collection)
+    safe_nft_collection = re.sub(r'[^0-9a-zA-Z_:.]', '', safe_nft_collection)
     js_nft_collection = json.dumps(safe_nft_collection)
 
     raw_nft_threshold = request.args.get('nft_threshold', '1')
