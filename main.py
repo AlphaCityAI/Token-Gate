@@ -4018,7 +4018,7 @@ def wallet_connect_webapp():
     # strings (0xPACKAGE::module::Struct) and plain hex addresses.
     safe_nft_collection = _normalize_collection_id(raw_nft_collection)
     # Sanitise: only allow characters valid in SUI addresses / type strings
-    safe_nft_collection = re.sub(r'[^0-9a-zA-Z_:.]', '', safe_nft_collection)
+    safe_nft_collection = re.sub(r'[^0-9a-zA-Z_:]', '', safe_nft_collection)
     js_nft_collection = json.dumps(safe_nft_collection)
 
     raw_nft_threshold = request.args.get('nft_threshold', '1')
@@ -4294,7 +4294,7 @@ def wallet_connect_webapp():
           <div style="font-weight:600; font-size:13px; color:var(--green-text);">Wallet Connected</div>
           <div class="cw-addr" id="connectedAddr"></div>
         </div>
-        <a href="#" id="changeWalletBtn" style="font-size:12px; color:var(--blue); text-decoration:none; white-space:nowrap;">Change ↻</a>
+        <a href="#" id="changeWalletBtn" role="button" style="font-size:12px; color:var(--blue); text-decoration:none; white-space:nowrap;">Change ↻</a>
       </div>
 
       <button class="btn btn-primary" id="verifyBtn" disabled>
@@ -4933,7 +4933,7 @@ def wallet_connect_webapp():
                    typeof _lastConnectedWallet._provider.disconnect === 'function') {{
           await _lastConnectedWallet._provider.disconnect();
         }}
-      }} catch (_) {{}}
+      }} catch (_) {{}}  // Disconnect errors are non-fatal; proceed with state reset
     }}
     // Reset connection state
     setConnectedWallet('', null, null);
