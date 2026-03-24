@@ -3872,6 +3872,8 @@ def wallet_connect_webapp():
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
   <title>GuildSafe — Verify Wallet</title>
+  <!-- Critical polyfill for SUI wallet SDK compatibility -->
+  <script>window.global = window;</script>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root {{
@@ -4266,20 +4268,90 @@ def wallet_connect_webapp():
   }}
 
   /* ══════════════════════════════════════════════════════
+     ── SUI Wallet Standard: event-based initialisation ──
+     ══════════════════════════════════════════════════════ */
+
+  // Modern Sui wallets (Slush, Sui Wallet, Phantom, etc.) register via the
+  // Wallet Standard event protocol.  The app MUST participate in this
+  // handshake for wallets to make themselves discoverable:
+  //   1. Listen for 'wallet-standard:register-wallet' events (wallets fire
+  //      these to register themselves with the page).
+  //   2. Dispatch a 'wallet-standard:app-ready' event to tell already-loaded
+  //      wallet extensions that the app is ready to receive registrations.
+  // Without this, many wallets will never appear in the picker.
+  // (Approach mirrors the staking & verify pages of Alphacity.)
+  const _registeredWallets = new Set();
+  let _walletListCache;
+
+  function _registerWallet(wallet) {{
+    _walletListCache = undefined;
+    _registeredWallets.add(wallet);
+  }}
+
+  function _getRegisteredWallets() {{
+    if (!_walletListCache) _walletListCache = Array.from(_registeredWallets);
+    return _walletListCache;
+  }}
+
+  // Custom event class used to dispatch 'wallet-standard:app-ready'.
+  function WalletAppReadyEvent(api) {{
+    var evt = new Event('wallet-standard:app-ready', {{
+      bubbles: false, cancelable: false, composed: false
+    }});
+    evt.detail = api;
+    return evt;
+  }}
+
+  function initWalletStandard() {{
+    var appApi = Object.freeze({{ register: function() {{
+      for (var i = 0; i < arguments.length; i++) _registerWallet(arguments[i]);
+    }} }});
+
+    try {{
+      window.addEventListener('wallet-standard:register-wallet', function(e) {{
+        if (e && e.detail && typeof e.detail === 'function') e.detail(appApi);
+      }});
+    }} catch (err) {{
+      // listener registration failed — continue with fallback detection
+    }}
+
+    try {{
+      window.dispatchEvent(WalletAppReadyEvent(appApi));
+    }} catch (err) {{
+      // dispatch failed — wallets may still register via the listener
+    }}
+  }}
+
+  // Run wallet standard init immediately so wallets can start registering.
+  initWalletStandard();
+
+  /* ══════════════════════════════════════════════════════
      ── SUI Wallet Standard: detect & connect wallets ──
      ══════════════════════════════════════════════════════ */
 
   function discoverWallets() {{
     /* Probe all standard mechanisms for SUI wallet detection:
-       1. Wallet Standard registry (window.__wallet_standard__) — official API;
+       1. Wallet Standard event-based registration (wallets registered via
+          initWalletStandard handshake — the preferred modern approach).
+       2. Wallet Standard registry (window.__wallet_standard__) — older API;
           the registry object exposes .get() directly, NOT via a .wallets property.
-       2. Well-known legacy window globals (suiWallet, slush, suiet, nightly …).
-       3. Phantom's SUI provider at window.phantom.sui.
+       3. Well-known legacy window globals (suiWallet, slush, suiet, nightly …).
+       4. Phantom's SUI provider at window.phantom.sui.
     */
     const found = [];
+    const seen = new Set();
     try {{
-      // Method 1: Wallet Standard registry
-      // The registry IS window.__wallet_standard__ — call .get() on it directly.
+      // Method 1: Wallets registered via the Wallet Standard event protocol.
+      for (const w of _getRegisteredWallets()) {{
+        const chains = w.chains || [];
+        const hasSui = chains.some(function(c) {{ return c.startsWith('sui:'); }});
+        if (hasSui && !seen.has(w.name)) {{
+          seen.add(w.name);
+          found.push(w);
+        }}
+      }}
+
+      // Method 2: Wallet Standard registry (older direct-access pattern).
       if (window.__wallet_standard__) {{
         const reg = window.__wallet_standard__;
         const list = typeof reg.get === 'function' ? reg.get()
@@ -4288,13 +4360,14 @@ def wallet_connect_webapp():
         for (const w of list) {{
           const chains = w.chains || [];
           const hasSui = chains.some(function(c) {{ return c.startsWith('sui:'); }});
-          if (hasSui) {{
+          if (hasSui && !seen.has(w.name)) {{
+            seen.add(w.name);
             found.push(w);
           }}
         }}
       }}
 
-      // Method 2: Check for well-known injected wallet objects
+      // Method 3: Check for well-known injected wallet objects
       const knownInjections = [
         {{ key: 'suiWallet', name: 'Sui Wallet' }},
         {{ key: 'slush',     name: 'Slush (Sui Wallet)' }},
@@ -4307,10 +4380,8 @@ def wallet_connect_webapp():
         const provider = window[inj.key];
         if (provider && typeof provider === 'object') {{
           // Avoid duplicates if already found via wallet standard
-          const isDupe = found.some(function(w) {{
-            return (w.name || '').toLowerCase().indexOf(inj.key.toLowerCase()) !== -1;
-          }});
-          if (!isDupe) {{
+          if (!seen.has(inj.name)) {{
+            seen.add(inj.name);
             found.push({{
               name: inj.name,
               icon: provider.icon || null,
@@ -4322,13 +4393,11 @@ def wallet_connect_webapp():
         }}
       }}
 
-      // Method 3: Phantom wallet — SUI provider lives at window.phantom.sui
+      // Method 4: Phantom wallet — SUI provider lives at window.phantom.sui
       if (window.phantom && window.phantom.sui) {{
         const phantomSui = window.phantom.sui;
-        const isDupe = found.some(function(w) {{
-          return (w.name || '').toLowerCase().indexOf('phantom') !== -1;
-        }});
-        if (!isDupe) {{
+        if (!seen.has('Phantom')) {{
+          seen.add('Phantom');
           found.push({{
             name: 'Phantom',
             icon: (phantomSui.icon || null),
@@ -4598,18 +4667,39 @@ def wallet_connect_webapp():
       const wallets = discoverWallets();
       renderWalletList(wallets);
 
-      // Also listen for late-registering wallets via the Wallet Standard registry.
-      // The registry lives directly on window.__wallet_standard__ (no .wallets sub-key).
+      // Listen for late-registering wallets via the Wallet Standard registry.
       if (window.__wallet_standard__ && typeof window.__wallet_standard__.on === 'function') {{
         window.__wallet_standard__.on('register', function() {{
           const updated = discoverWallets();
           renderWalletList(updated);
         }});
       }}
+
+      // Also listen for wallets that register via the event-based protocol
+      // after our initial scan.
+      window.addEventListener('wallet-standard:register-wallet', function(e) {{
+        if (e && e.detail && typeof e.detail === 'function') {{
+          var appApi = Object.freeze({{ register: function() {{
+            for (var i = 0; i < arguments.length; i++) _registerWallet(arguments[i]);
+          }} }});
+          try {{ e.detail(appApi); }} catch (_) {{}}
+        }}
+        var updated = discoverWallets();
+        renderWalletList(updated);
+      }});
     }}
 
-    // 300 ms lets most wallet extensions finish their synchronous injection.
-    var scanTimer = setTimeout(doScan, 300);
+    // Give wallet extensions time to inject and register.  Multiple passes
+    // ensure we catch both fast and slow wallets.  We only proceed early if
+    // wallets are actually found; otherwise the 3 s failsafe handles it.
+    function tryEarlyScan() {{
+      if (scanDone) return;
+      if (discoverWallets().length > 0) doScan();
+    }}
+    var scanTimers = [
+      setTimeout(tryEarlyScan, 300),
+      setTimeout(tryEarlyScan, 800)
+    ];
 
     // Failsafe: always show UI after 3 s — prevents infinite "Detecting wallets…"
     // spin if an extension stalls or the environment is unusual.
@@ -4619,11 +4709,11 @@ def wallet_connect_webapp():
       }}
     }}, 3000);
 
-    // Some wallets fire a custom event when they register.  Listen early so we
-    // can kick off the scan immediately instead of waiting for the 300 ms timer.
+    // Wallets may fire a custom event when they register.  Listen early so we
+    // can kick off the scan immediately instead of waiting for the timers.
     window.addEventListener('wallet-standard:register-wallet', function() {{
-      clearTimeout(scanTimer);
-      scanTimer = setTimeout(doScan, 50);
+      for (var t = 0; t < scanTimers.length; t++) clearTimeout(scanTimers[t]);
+      scanTimers = [setTimeout(doScan, 50)];
     }}, {{ once: true }});
   }}
 
