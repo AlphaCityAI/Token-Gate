@@ -590,7 +590,7 @@ def wallet_already_registered(wallet_address, group_id, user_id=None):
       re-registration so on-chain values are refreshed).
     • If the wallet belongs to a *different* user → return ``True``.
 
-    When *user_id* is ``None`` the behaviour is unchanged (legacy callers).
+    When *user_id* is ``None`` the behavior is unchanged (legacy callers).
     """
     with get_db_cursor() as (conn, cur):
         cur.execute("SELECT user_id, wallets FROM user_wallets WHERE group_id=%s", (group_id,))
