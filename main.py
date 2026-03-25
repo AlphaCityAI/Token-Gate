@@ -2643,9 +2643,11 @@ def _fetch_kiosk_nfts(addresses, collection_id, show_content=False, max_retries=
                             if item_id:
                                 obj_resp = sui_rpc_request(
                                     "sui_getObject",
-                                    [item_id, {"showType": True,
-                                               "showContent": True,
-                                               "showDisplay": True}],
+                                    [item_id, {
+                                        "showType": True,
+                                        "showContent": True,
+                                        "showDisplay": True,
+                                    }],
                                     max_retries=max_retries,
                                 )
                                 if obj_resp and obj_resp.get("data"):
@@ -2732,7 +2734,7 @@ def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=
                 seen_ids.add(oid)
                 results.append(obj)
     except Exception as e:
-        logging.error(f"Error fetching kiosk NFTs: {e}")
+        logging.error(f"Error fetching kiosk NFTs for collection {collection_id}: {e}")
 
     return results
 
