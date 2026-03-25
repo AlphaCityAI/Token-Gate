@@ -1435,7 +1435,8 @@ def handle_mywallets_callback(call):
 
             with config_lock:
                 cfg = SUBSCRIBER_CONFIGS.get(group_id)
-            save_wallet_for_user(group_id, user_id, call.from_user.username or call.from_user.first_name, updated_wallets, replace_existing=True, registration_type=cfg.get("registration_mode", "token") if cfg else "token")
+                reg_type = cfg.get("registration_mode", "token") if cfg else "token"
+            save_wallet_for_user(group_id, user_id, call.from_user.username or call.from_user.first_name, updated_wallets, replace_existing=True, registration_type=reg_type)
             bot.send_message(call.message.chat.id, f"Wallet removed successfully.")
             bot.delete_message(call.message.chat.id, call.message.message_id)
             show_mywallets_private(call.message.chat.id, group_id)
@@ -2027,7 +2028,12 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
                     logging.error(f"Error getting NFT count for user {username}: {e}")
                     user_nft_count = None
 
-        wallet_text = "\n".join(wallet_lines) if wallet_lines else ("None" if has_token else "\n".join(wallets) if wallets else "None")
+        if wallet_lines:
+            wallet_text = "\n".join(wallet_lines)
+        elif not has_token and wallets:
+            wallet_text = "\n".join(wallets)
+        else:
+            wallet_text = "None"
 
         # Build the holdings summary line
         holdings_parts = []
@@ -2064,8 +2070,8 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
             else:
                 status = "Below Threshold"
         elif registration_mode == "both":
-            token_ok = balance_complete and total_balance >= threshold if has_token else False
-            nft_ok = user_nft_count is not None and user_nft_count >= nft_threshold if has_nft else False
+            token_ok = (balance_complete and total_balance >= threshold) if has_token else False
+            nft_ok = (user_nft_count is not None and user_nft_count >= nft_threshold) if has_nft else False
             if not balance_complete and user_nft_count is None:
                 status = "No Data"
             elif token_ok or nft_ok:
