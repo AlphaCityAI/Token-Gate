@@ -582,17 +582,29 @@ def get_user_registrations_for_group(group_id):
     return registrations
 
 @db_retry
-def wallet_already_registered(wallet_address, group_id):
+def wallet_already_registered(wallet_address, group_id, user_id=None):
+    """Check if a wallet is already registered in the group.
+
+    When *user_id* is provided the check is ownership-aware:
+    • If the wallet belongs to that same user → return ``False`` (allow
+      re-registration so on-chain values are refreshed).
+    • If the wallet belongs to a *different* user → return ``True``.
+
+    When *user_id* is ``None`` the behavior is unchanged (legacy callers).
+    """
     with get_db_cursor() as (conn, cur):
-        cur.execute("SELECT wallets FROM user_wallets WHERE group_id=%s", (group_id,))
+        cur.execute("SELECT user_id, wallets FROM user_wallets WHERE group_id=%s", (group_id,))
         rows = cur.fetchall()
     wallet_address = wallet_address.lower()
-    for (wallets_json,) in rows:
+    for (row_user_id, wallets_json) in rows:
         try:
             wallets = json.loads(wallets_json) if wallets_json else []
         except Exception:
             wallets = []
         if wallet_address in [w.lower() for w in wallets]:
+            # Same user re-registering their own wallet → allow it
+            if user_id is not None and row_user_id == user_id:
+                return False
             return True
     return False
 
@@ -1459,8 +1471,8 @@ def process_add_wallet_private(message, group_id, replace_existing):
             bot.reply_to(message, "❌ Invalid wallet address format. Please try again.")
             return
 
-        if wallet_already_registered(wallet_address, group_id):
-            bot.reply_to(message, "⚠️ This wallet address is already registered in this group.")
+        if wallet_already_registered(wallet_address, group_id, user_id=user_id):
+            bot.reply_to(message, "⚠️ This wallet address is already registered to another user in this group.")
             return
 
         # Since this is a direct add/replace, we skip the balance check and go to ownership verification
@@ -3154,8 +3166,8 @@ def add_wallet_command(message):
             bot.reply_to(message, f"❌ Invalid wallet address format: '{wallet_address}'. Please check and try again.")
             return
 
-        if wallet_already_registered(wallet_address, chat_id):
-            bot.reply_to(message, "⚠️ This wallet address is already registered to a user in this group.")
+        if wallet_already_registered(wallet_address, chat_id, user_id=target_user.id):
+            bot.reply_to(message, "⚠️ This wallet address is already registered to another user in this group.")
             return
 
         processing_msg = bot.reply_to(message, f"⏳ Adding wallet for {target_user.username or target_user.first_name}...")
@@ -3862,8 +3874,8 @@ def register_wallets(message):
             parse_mode="Markdown"
         )
 
-    if wallet_already_registered(wallet_address, group_id):
-        return bot.reply_to(message, "⚠️ This wallet address is already registered for this group.")
+    if wallet_already_registered(wallet_address, group_id, user_id=user_id):
+        return bot.reply_to(message, "⚠️ This wallet address is already registered to another user in this group.")
 
     with config_lock:
         cfg = SUBSCRIBER_CONFIGS.get(group_id)
@@ -4020,8 +4032,8 @@ def handle_wallet_webapp_data(message):
         bot.reply_to(message, "❌ No registration context found. Please run /register in the target group first.")
         return
 
-    if wallet_already_registered(wallet_address, group_id):
-        bot.reply_to(message, "⚠️ This wallet address is already registered for this group.")
+    if wallet_already_registered(wallet_address, group_id, user_id=user_id):
+        bot.reply_to(message, "⚠️ This wallet address is already registered to another user in this group.")
         return
 
     with config_lock:
@@ -5493,12 +5505,12 @@ def api_verify():
             resp = jsonify({'success': False, 'error': 'No registration context found. Please run /register in the target group first.'})
             return _add_cors_headers(resp), 400
 
-        if wallet_already_registered(wallet_address, group_id):
+        if wallet_already_registered(wallet_address, group_id, user_id=tg_user_id):
             try:
-                bot.send_message(tg_user_id, "⚠️ This wallet address is already registered for this group.")
+                bot.send_message(tg_user_id, "⚠️ This wallet address is already registered to another user in this group.")
             except Exception:
                 pass
-            resp = jsonify({'success': False, 'error': 'Wallet already registered for this group'})
+            resp = jsonify({'success': False, 'error': 'Wallet already registered to another user in this group'})
             return _add_cors_headers(resp), 409
 
         with config_lock:
