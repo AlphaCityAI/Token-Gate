@@ -2560,11 +2560,111 @@ def _build_owned_objects_query(collection_id: str, *, show_content: bool = False
     return query
 
 
+_KIOSK_OWNER_CAP_TYPE = (
+    "0x0000000000000000000000000000000000000000000000000000000000000002"
+    "::kiosk::KioskOwnerCap"
+)
+
+
+def _fetch_kiosk_nfts(addresses, collection_id, show_content=False, max_retries=2):
+    """Fetch NFTs held inside SUI Kiosks owned by *addresses*.
+
+    Many SUI NFT collections use the Kiosk standard (``0x2::kiosk``).  NFTs
+    placed inside a Kiosk are **not** directly owned by the user's address, so
+    ``suix_getOwnedObjects`` with a ``StructType`` filter will not find them.
+
+    This helper discovers the user's Kiosks via their ``KioskOwnerCap`` objects,
+    then enumerates each Kiosk's dynamic fields to count items matching
+    *collection_id*.
+    """
+    normalized = _normalize_collection_id(collection_id)
+    if not normalized:
+        return []
+
+    hint_lower = normalized.lower()
+
+    cap_query = {
+        "filter": {"StructType": _KIOSK_OWNER_CAP_TYPE},
+        "options": {"showType": True, "showContent": True},
+    }
+
+    results = []
+    for owner in [a.lower() for a in addresses if a]:
+        # Step 1: find all KioskOwnerCap objects → extract Kiosk IDs
+        kiosk_ids = []
+        cursor = None
+        while True:
+            rpc_result = sui_rpc_request(
+                "suix_getOwnedObjects",
+                [owner, cap_query, cursor, 50],
+                max_retries=max_retries,
+            )
+            data = rpc_result.get("data", []) if rpc_result else []
+            for item in data:
+                obj = item.get("data", {})
+                content = obj.get("content") or {}
+                fields = content.get("fields") or {}
+                kiosk_id = fields.get("for")
+                if kiosk_id:
+                    kiosk_ids.append(kiosk_id)
+            if not rpc_result or not rpc_result.get("hasNextPage"):
+                break
+            cursor = rpc_result.get("nextCursor")
+
+        # Step 2: enumerate each Kiosk's dynamic fields for matching NFTs
+        for kiosk_id in kiosk_ids:
+            df_cursor = None
+            while True:
+                df_result = sui_rpc_request(
+                    "suix_getDynamicFields",
+                    [kiosk_id, df_cursor, 50],
+                    max_retries=max_retries,
+                )
+                df_data = df_result.get("data", []) if df_result else []
+                for field in df_data:
+                    # Only consider Kiosk Item entries (skip Listing, etc.)
+                    name_info = field.get("name") or {}
+                    name_type = (name_info.get("type") or "").lower()
+                    if "kiosk::item" not in name_type:
+                        continue
+                    obj_type = (field.get("objectType") or "").lower()
+                    if not obj_type:
+                        continue
+                    # Match against collection hint
+                    if hint_lower in obj_type:
+                        nft_entry = {
+                            "objectId": field.get("objectId", ""),
+                            "type": field.get("objectType", ""),
+                        }
+                        if show_content:
+                            # Fetch full object data when content is needed
+                            # (e.g. trait extraction)
+                            item_id = (name_info.get("value") or {}).get("id", "")
+                            if item_id:
+                                obj_resp = sui_rpc_request(
+                                    "sui_getObject",
+                                    [item_id, {"showType": True,
+                                               "showContent": True,
+                                               "showDisplay": True}],
+                                    max_retries=max_retries,
+                                )
+                                if obj_resp and obj_resp.get("data"):
+                                    nft_entry = obj_resp["data"]
+                        results.append(nft_entry)
+                if not df_result or not df_result.get("hasNextPage"):
+                    break
+                df_cursor = df_result.get("nextCursor")
+
+    return results
+
+
 def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=2):
     """Fetch NFT objects owned by *addresses* that belong to *collection_id*.
 
     Returns a list of object dicts (each containing at least ``type`` and
     ``objectId``; when *show_content* is True also ``content`` / ``display``).
+
+    Checks both directly-owned objects **and** items held inside SUI Kiosks.
     """
     normalized = _normalize_collection_id(collection_id)
     query = _build_owned_objects_query(normalized, show_content=show_content)
@@ -2591,6 +2691,7 @@ def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=
         return hint_lower in otype
 
     results = []
+    seen_ids = set()
     for owner in [a.lower() for a in addresses if a]:
         cursor = None
         while True:
@@ -2602,17 +2703,37 @@ def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=
             data = rpc_result.get("data", []) if rpc_result else []
             for item in data:
                 obj = item.get("data", {})
+                oid = obj.get("objectId", "")
+                if oid in seen_ids:
+                    continue
                 if has_filter:
                     # RPC already filtered; just skip coins/non-Move objects
                     otype = (obj.get("type") or "").lower()
                     if otype and "::" in otype and "coin::" not in otype:
+                        seen_ids.add(oid)
                         results.append(obj)
                 else:
                     if matches(obj):
+                        seen_ids.add(oid)
                         results.append(obj)
             if not rpc_result or not rpc_result.get("hasNextPage"):
                 break
             cursor = rpc_result.get("nextCursor")
+
+    # Also check NFTs held inside SUI Kiosks
+    try:
+        kiosk_nfts = _fetch_kiosk_nfts(
+            addresses, collection_id,
+            show_content=show_content, max_retries=max_retries,
+        )
+        for obj in kiosk_nfts:
+            oid = obj.get("objectId", "")
+            if oid and oid not in seen_ids:
+                seen_ids.add(oid)
+                results.append(obj)
+    except Exception as e:
+        logging.error(f"Error fetching kiosk NFTs: {e}")
+
     return results
 
 
@@ -5006,7 +5127,6 @@ def wallet_connect_webapp():
       $fill.style.width = '60%';
       try {{
         let count = 0;
-        let cursor = null;
         const collLower = NFT_COLLECTION.toLowerCase();
         // Build query with server-side filter when possible
         const baseOpts = {{ showType: true }};
@@ -5016,6 +5136,9 @@ def wallet_connect_webapp():
         }} else if (/^0x[0-9a-f]+$/i.test(NFT_COLLECTION)) {{
           rpcFilter = {{ Package: NFT_COLLECTION }};
         }}
+
+        // 1) Check directly-owned NFTs
+        let cursor = null;
         do {{
           const query = rpcFilter
             ? {{ filter: rpcFilter, options: baseOpts }}
@@ -5028,10 +5151,8 @@ def wallet_connect_webapp():
             if (!objType || objType.indexOf('::') === -1) continue;
             if (objType.indexOf('coin::') !== -1) continue;
             if (rpcFilter) {{
-              // RPC already filtered by collection
               count++;
             }} else {{
-              // Client-side matching fallback
               if (objType.startsWith(collLower + '::') ||
                   objType === collLower ||
                   objType.indexOf(collLower) !== -1) {{
@@ -5041,6 +5162,50 @@ def wallet_connect_webapp():
           }}
           cursor = page.hasNextPage ? page.nextCursor : null;
         }} while (cursor && count < NFT_THRESHOLD);
+
+        // 2) Check NFTs inside SUI Kiosks (if threshold not yet met)
+        if (count < NFT_THRESHOLD) {{
+          $status.textContent = 'Checking Kiosk NFTs…';
+          $fill.style.width = '70%';
+          const KIOSK_CAP_TYPE = '0x0000000000000000000000000000000000000000000000000000000000000002::kiosk::KioskOwnerCap';
+          const capQuery = {{
+            filter: {{ StructType: KIOSK_CAP_TYPE }},
+            options: {{ showType: true, showContent: true }}
+          }};
+          // Find all KioskOwnerCap objects to get Kiosk IDs
+          const kioskIds = [];
+          let capCursor = null;
+          do {{
+            const capPage = await suiRpc('suix_getOwnedObjects', [wallet, capQuery, capCursor, 50]);
+            const capItems = capPage.data || [];
+            for (const ci of capItems) {{
+              const capObj = ci.data || {{}};
+              const capFields = ((capObj.content || {{}}).fields) || {{}};
+              const kioskId = capFields['for'];
+              if (kioskId) kioskIds.push(kioskId);
+            }}
+            capCursor = capPage.hasNextPage ? capPage.nextCursor : null;
+          }} while (capCursor);
+
+          // Enumerate each Kiosk's items via dynamic fields
+          for (let ki = 0; ki < kioskIds.length && count < NFT_THRESHOLD; ki++) {{
+            let dfCursor = null;
+            do {{
+              const dfPage = await suiRpc('suix_getDynamicFields', [kioskIds[ki], dfCursor, 50]);
+              const dfItems = dfPage.data || [];
+              for (const df of dfItems) {{
+                const nameType = ((df.name || {{}}).type || '').toLowerCase();
+                if (nameType.indexOf('kiosk::item') === -1) continue;
+                const dfObjType = (df.objectType || '').toLowerCase();
+                if (dfObjType && dfObjType.indexOf(collLower) !== -1) {{
+                  count++;
+                }}
+              }}
+              dfCursor = dfPage.hasNextPage ? dfPage.nextCursor : null;
+            }} while (dfCursor && count < NFT_THRESHOLD);
+          }}
+        }}
+
         result.nftCount = count;
         result.nftOk = count >= NFT_THRESHOLD;
       }} catch (e) {{
