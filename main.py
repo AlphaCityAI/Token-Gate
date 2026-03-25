@@ -1433,7 +1433,10 @@ def handle_mywallets_callback(call):
             # Case-insensitive removal
             updated_wallets = [w for w in current_wallets if w.lower() != wallet_to_remove.lower()]
 
-            save_wallet_for_user(group_id, user_id, call.from_user.username or call.from_user.first_name, updated_wallets, replace_existing=True)
+            with config_lock:
+                cfg = SUBSCRIBER_CONFIGS.get(group_id)
+                reg_type = cfg.get("registration_mode", "token") if cfg else "token"
+            save_wallet_for_user(group_id, user_id, call.from_user.username or call.from_user.first_name, updated_wallets, replace_existing=True, registration_type=reg_type)
             bot.send_message(call.message.chat.id, f"Wallet removed successfully.")
             bot.delete_message(call.message.chat.id, call.message.message_id)
             show_mywallets_private(call.message.chat.id, group_id)
@@ -1583,7 +1586,8 @@ def handle_verify_wallet_callback(call):
                 user_id,
                 call.from_user.username or call.from_user.first_name,
                 [wallet_address.lower()],
-                replace_existing=False
+                replace_existing=False,
+                registration_type=cfg.get("registration_mode", "token")
             )
 
             if not success:
@@ -1946,16 +1950,29 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
 
     with config_lock:
         cfg = SUBSCRIBER_CONFIGS.get(group_id)
-    if not cfg or not cfg.get("token"):
+    if not cfg:
         if processing_msg:
-             bot.edit_message_text("No token configured for this group.", chat_id=target_chat_id, message_id=processing_msg.message_id)
+             bot.edit_message_text("No configuration found for this group.", chat_id=target_chat_id, message_id=processing_msg.message_id)
         else:
-             bot.send_message(target_chat_id, "No token configured for this group.")
+             bot.send_message(target_chat_id, "No configuration found for this group.")
         return
 
-    token = cfg["token"]
+    registration_mode = cfg.get("registration_mode", "token")
+    token = cfg.get("token", "")
     decimals = cfg.get("decimals", 6)
     threshold = cfg.get("minimum_holding", 0)
+    nft_collection_id = cfg.get("nft_collection_id", "")
+    nft_threshold = cfg.get("nft_threshold", 1)
+
+    # Validate that at least one gating criterion is configured
+    has_token = bool(token) and registration_mode in ["token", "both"]
+    has_nft = bool(nft_collection_id) and registration_mode in ["nft", "both"]
+    if not has_token and not has_nft:
+        if processing_msg:
+             bot.edit_message_text("No token or NFT gating configured for this group.", chat_id=target_chat_id, message_id=processing_msg.message_id)
+        else:
+             bot.send_message(target_chat_id, "No token or NFT gating configured for this group.")
+        return
 
     regs = get_user_registrations_for_group(group_id)
     if not regs:
@@ -1972,13 +1989,13 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
             for wallet in reg["wallets"]:
                 all_wallets_to_check.add(wallet.lower())
 
-    # BATCH FETCH: Step 2 - Make a single API call for all collected wallets
+    # BATCH FETCH: Step 2 - Fetch token balances if applicable
     all_balances = {}
-    if all_wallets_to_check:
+    if has_token and all_wallets_to_check:
         logging.info(f"Starting batch balance check for {len(all_wallets_to_check)} unique wallets in group {group_id} report.")
         all_balances = fetch_wallet_balances(list(all_wallets_to_check), token, decimals)
 
-    # BATCH FETCH: Step 3 - Process users using the pre-fetched balance data
+    # BATCH FETCH: Step 3 - Process users using the pre-fetched data
     rows = []
     for reg in regs:
         username = reg["username"]
@@ -1986,33 +2003,81 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
         exempt = reg["is_exempt"]
 
         wallet_lines = []
-        total = 0.0
-        complete = True
+        total_balance = 0.0
+        balance_complete = True
+        user_nft_count = None
 
-        if not exempt:
-            for w in wallets:
-                b = all_balances.get(w.lower()) # Instant lookup, no API call
-                if b is None:
-                    wallet_lines.append(f"{w}: N/A")
-                    complete = False
-                else:
-                    wallet_lines.append(f"{w}: {b:,.2f}")
-                    total += b
+        if not exempt and wallets:
+            # Token balance check
+            if has_token:
+                for w in wallets:
+                    b = all_balances.get(w.lower())
+                    if b is None:
+                        wallet_lines.append(f"{w}: N/A")
+                        balance_complete = False
+                    else:
+                        wallet_lines.append(f"{w}: {b:,.2f}")
+                        total_balance += b
 
-        wallet_text = "\n".join(wallet_lines) if wallet_lines else "None"
-        total_str = "" if not complete and wallets else f"{total:,.2f}"
+            # NFT count check (per-user, across all their wallets)
+            if has_nft:
+                try:
+                    user_wallets_lower = [w.lower() for w in wallets]
+                    user_nft_count = get_user_nft_count(user_wallets_lower, nft_collection_id)
+                except Exception as e:
+                    logging.error(f"Error getting NFT count for user {username}: {e}")
+                    user_nft_count = None
 
+        if wallet_lines:
+            wallet_text = "\n".join(wallet_lines)
+        elif not has_token and wallets:
+            wallet_text = "\n".join(wallets)
+        else:
+            wallet_text = "None"
+
+        # Build the holdings summary line
+        holdings_parts = []
+        if has_token:
+            if not balance_complete and wallets:
+                holdings_parts.append("N/A")
+            else:
+                holdings_parts.append(f"{total_balance:,.2f} tokens")
+        if has_nft:
+            if user_nft_count is not None:
+                holdings_parts.append(f"{user_nft_count} NFTs")
+            elif not exempt and wallets:
+                holdings_parts.append("NFTs: N/A")
+        total_str = " | ".join(holdings_parts) if holdings_parts else ""
+
+        # Determine status based on registration mode
         status = ""
         if exempt:
             status = "Exempt"
         elif not wallets:
             status = "No Wallets"
-        elif not complete:
-            status = "No Data"
-        elif total >= threshold:
-            status = "Above Threshold"
-        else:
-            status = "Below Threshold"
+        elif registration_mode == "token":
+            if not balance_complete:
+                status = "No Data"
+            elif total_balance >= threshold:
+                status = "Above Threshold"
+            else:
+                status = "Below Threshold"
+        elif registration_mode == "nft":
+            if user_nft_count is None:
+                status = "No Data"
+            elif user_nft_count >= nft_threshold:
+                status = "Above Threshold"
+            else:
+                status = "Below Threshold"
+        elif registration_mode == "both":
+            token_ok = (balance_complete and total_balance >= threshold) if has_token else False
+            nft_ok = (user_nft_count is not None and user_nft_count >= nft_threshold) if has_nft else False
+            if not balance_complete and user_nft_count is None:
+                status = "No Data"
+            elif token_ok or nft_ok:
+                status = "Above Threshold"
+            else:
+                status = "Below Threshold"
 
         rows.append({
             "Username": username,
@@ -2028,7 +2093,7 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
             block = f"*{r['Username']}* — {r['Status']}\n"
             block += "\n".join(r["Wallets"].split("\n")) + "\n"
             if r["Total Balance"]:
-                block += f"_Total: {r['Total Balance']}_\n"
+                block += f"_Holdings: {r['Total Balance']}_\n"
             preview_lines.append(block)
         preview = "\n".join(preview_lines)
 
@@ -3095,12 +3160,16 @@ def add_wallet_command(message):
 
         processing_msg = bot.reply_to(message, f"⏳ Adding wallet for {target_user.username or target_user.first_name}...")
 
+        with config_lock:
+            cfg = SUBSCRIBER_CONFIGS.get(chat_id)
+
         success = save_wallet_for_user(
             chat_id, 
             target_user.id, 
             target_user.username or target_user.first_name, 
             [wallet_address.lower()],
-            replace_existing=False
+            replace_existing=False,
+            registration_type=cfg.get("registration_mode", "token") if cfg else "token"
         )
 
         if success:
@@ -3600,7 +3669,7 @@ def confirm_verification(message):
             return
 
         wallet_lower = wallet_address.lower()
-        success = save_wallet_for_user(group_id, user_id, message.from_user.username or message.from_user.first_name, [wallet_lower], replace_existing=False)
+        success = save_wallet_for_user(group_id, user_id, message.from_user.username or message.from_user.first_name, [wallet_lower], replace_existing=False, registration_type=cfg.get("registration_mode", "token"))
         if not success:
             bot.edit_message_text("❌ Failed to save your wallet. Please try again later.", chat_id=message.chat.id, message_id=processing_msg.message_id)
             return
@@ -3987,7 +4056,8 @@ def handle_wallet_webapp_data(message):
         user_id,
         message.from_user.username or message.from_user.first_name,
         [wallet_address.lower()],
-        replace_existing=False
+        replace_existing=False,
+        registration_type=cfg.get("registration_mode", "token")
     )
 
     if not success:
@@ -5129,6 +5199,7 @@ def wallet_connect_webapp():
       $fill.style.width = '60%';
       try {{
         let count = 0;
+        const MAX_NFT_ENUMERATE = 500;
         const collLower = NFT_COLLECTION.toLowerCase();
         // Build query with server-side filter when possible
         const baseOpts = {{ showType: true }};
@@ -5163,10 +5234,10 @@ def wallet_connect_webapp():
             }}
           }}
           cursor = page.hasNextPage ? page.nextCursor : null;
-        }} while (cursor && count < NFT_THRESHOLD);
+        }} while (cursor && count < MAX_NFT_ENUMERATE);
 
-        // 2) Check NFTs inside SUI Kiosks (if threshold not yet met)
-        if (count < NFT_THRESHOLD) {{
+        // 2) Also check NFTs inside SUI Kiosks
+        if (count < MAX_NFT_ENUMERATE) {{
           $status.textContent = 'Checking Kiosk NFTs…';
           $fill.style.width = '70%';
           const KIOSK_CAP_TYPE = '0x0000000000000000000000000000000000000000000000000000000000000002::kiosk::KioskOwnerCap';
@@ -5190,7 +5261,7 @@ def wallet_connect_webapp():
           }} while (capCursor);
 
           // Enumerate each Kiosk's items via dynamic fields
-          for (let ki = 0; ki < kioskIds.length && count < NFT_THRESHOLD; ki++) {{
+          for (let ki = 0; ki < kioskIds.length && count < MAX_NFT_ENUMERATE; ki++) {{
             let dfCursor = null;
             do {{
               const dfPage = await suiRpc('suix_getDynamicFields', [kioskIds[ki], dfCursor, 50]);
@@ -5204,7 +5275,7 @@ def wallet_connect_webapp():
                 }}
               }}
               dfCursor = dfPage.hasNextPage ? dfPage.nextCursor : null;
-            }} while (dfCursor && count < NFT_THRESHOLD);
+            }} while (dfCursor && count < MAX_NFT_ENUMERATE);
           }}
         }}
 
@@ -5465,7 +5536,7 @@ def api_verify():
         # Resolve display name (best-effort)
         username = _get_user_display_name(tg_user_id)
 
-        success = save_wallet_for_user(group_id, tg_user_id, username, [wallet_address.lower()], replace_existing=False)
+        success = save_wallet_for_user(group_id, tg_user_id, username, [wallet_address.lower()], replace_existing=False, registration_type=cfg.get("registration_mode", "token"))
         if not success:
             resp = jsonify({'success': False, 'error': 'Failed to save wallet. Please try again later.'})
             return _add_cors_headers(resp), 500
