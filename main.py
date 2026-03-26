@@ -5437,8 +5437,10 @@ def wallet_connect_webapp():
         }} else {{
           $rc.innerHTML =
             '<div class="result-icon">❌</div>' +
-            '<h2>Verification Failed</h2>' +
-            '<p>' + (result.error || 'Your wallet does not currently meet the group\\'s requirements.') + '</p>';
+            '<h2>Verification Failed</h2>';
+          var errP = document.createElement('p');
+          errP.textContent = result.error || 'Your wallet does not currently meet the group\\'s requirements.';
+          $rc.appendChild(errP);
           $alert.textContent = '❌ ' + (result.error || 'Verification failed. Please try again.');
           $alert.className = 'alert alert-error show';
         }}
