@@ -38,6 +38,7 @@ REMINDER_THRESHOLD = 1200   # Reminder threshold in seconds (20 minutes)
 VERIFICATION_TIMEOUT = 600  # Verification timeout in seconds (10 minute)
 ALERT_COOLDOWN_DAYS = 2 # Days before re-alerting a user with low balance
 MAX_CACHE_SIZE = 1000  # Maximum number of entries in balance/NFT caches
+NFT_RPC_RETRY_DELAY = 2  # Seconds to wait before retrying an NFT RPC check
 DB_POOL_MIN = int(os.getenv('DB_POOL_MIN', '5'))  # Minimum database connections
 DB_POOL_MAX = int(os.getenv('DB_POOL_MAX', '15'))  # Maximum database connections
 TASK_JITTER_PERCENT = 0.1  # Add ±10% jitter to task intervals to prevent thundering herd
@@ -2566,7 +2567,10 @@ def calculate_user_vote_weight(group_id, user_id):
 
         # Calculate NFT-based votes
         if nft_collection_id and votes_per_nft > 0:
-            nft_count = get_user_nft_count(wallet_addresses, nft_collection_id) or 0
+            nft_count = get_user_nft_count(wallet_addresses, nft_collection_id)
+            if nft_count is None:
+                logging.warning(f"NFT count RPC failed for user {user_id} in vote weight calc, treating as 0")
+                nft_count = 0
             nft_votes = nft_count * votes_per_nft
             total_weight += nft_votes
 
@@ -2975,6 +2979,7 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
     token_valid = False
     nft_valid = False
     trait_valid = True
+    rpc_failed = False
 
     token_balance = None
     # When force_fresh is True (interactive verification), bypass the in-memory
@@ -2985,6 +2990,7 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
         balances = fetch_wallet_balances([wallet_lower], token, decimals, use_cache=use_cache_flag)
         token_balance = balances.get(wallet_lower)
         if token_balance is None:
+            rpc_failed = True
             errors.append("⚠️ Unable to verify token balance right now. Please retry in a moment.")
         else:
             token_valid = token_balance >= minimum_holding
@@ -3003,10 +3009,11 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
         # transient errors (rate limits, kiosk fetch timeouts) can cause
         # false negatives when the user's NFTs are inside SUI Kiosks.
         if nft_count is None and force_fresh:
-            time.sleep(2)
+            time.sleep(NFT_RPC_RETRY_DELAY)
             logging.info(f"Retrying NFT count for wallet {wallet_lower} after initial RPC failure")
             nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=False, max_retries=rpc_retries)
         if nft_count is None:
+            rpc_failed = True
             errors.append("⚠️ Unable to verify NFT ownership right now. Please retry in a moment.")
             details.append(f"*NFTs in Collection:* ⚠️ check failed (threshold: {nft_threshold})")
         else:
@@ -3054,6 +3061,7 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
         "requirements_met": requirements_met,
         "details": details,
         "errors": errors,
+        "rpc_failed": rpc_failed,
     }
 
 @db_retry
@@ -5614,8 +5622,7 @@ def api_verify():
                 pass
             # Provide a more specific error message to the frontend when the
             # failure is due to an RPC error rather than a genuine shortfall.
-            rpc_error = any('Unable to verify' in e or 'check failed' in e for e in eval_errors)
-            if rpc_error:
+            if requirement_eval.get('rpc_failed'):
                 resp_error = 'Unable to verify on-chain holdings right now. Please try again.'
                 status_code = 503
             else:
