@@ -2966,9 +2966,12 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
     trait_valid = True
 
     token_balance = None
-    verification_ttl = VERIFICATION_CACHE_TTL if force_fresh else None
+    # When force_fresh is True (interactive verification), bypass the in-memory
+    # cache entirely so the RPC is always called with live data.  Otherwise use
+    # the normal cache with default TTL.
+    use_cache_flag = not force_fresh
     if registration_mode in ["token", "both"] and token:
-        balances = fetch_wallet_balances([wallet_lower], token, decimals, use_cache=True, cache_ttl=verification_ttl)
+        balances = fetch_wallet_balances([wallet_lower], token, decimals, use_cache=use_cache_flag)
         token_balance = balances.get(wallet_lower)
         if token_balance is None:
             errors.append("⚠️ Unable to verify token balance right now. Please retry in a moment.")
@@ -2981,7 +2984,7 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
     trait_api_failed = False
 
     if registration_mode in ["nft", "both"] and nft_collection_id:
-        nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=True, cache_ttl=verification_ttl)
+        nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=use_cache_flag)
         nft_valid = nft_count >= nft_threshold
         details.append(f"*NFTs in Collection:* {nft_count} {'✓' if nft_valid else '✗'} (threshold: {nft_threshold})")
 
@@ -4054,15 +4057,9 @@ def handle_wallet_webapp_data(message):
         )
     requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
 
-    if not requirement_eval["requirements_met"]:
-        error_text = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
-            requirement_eval["errors"] or ["Please retry after updating your holdings."]
-        )
-        if requirement_eval["details"]:
-            error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
-        bot.reply_to(message, error_text, parse_mode="Markdown")
-        return
-
+    # Always save / update the wallet so the user's database record reflects
+    # the current registration mode and wallet list, even when requirements
+    # are not met right now (e.g. holdings changed, mode switched, etc.).
     success = save_wallet_for_user(
         group_id,
         user_id,
@@ -4078,6 +4075,16 @@ def handle_wallet_webapp_data(message):
 
     with get_db_cursor() as (conn, cur):
         cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (user_id,))
+
+    if not requirement_eval["requirements_met"]:
+        error_text = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
+            requirement_eval["errors"] or ["Please retry after updating your holdings."]
+        )
+        if requirement_eval["details"]:
+            error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
+        error_text += "\n\n_Your wallet has been saved. You can re-verify at any time._"
+        bot.reply_to(message, error_text, parse_mode="Markdown")
+        return
 
     msg_lines, group_name = _build_verification_success_message(group_id, wallet_address, requirement_eval)
     bot.reply_to(message, "\n".join(msg_lines), parse_mode="Markdown", disable_web_page_preview=True)
@@ -4789,6 +4796,17 @@ def wallet_connect_webapp():
 
   async function connectToWallet(wallet) {{
     try {{
+      // Disconnect any existing session so the wallet shows its account
+      // chooser instead of auto-connecting to a previously-selected address.
+      try {{
+        const dcFeature = wallet.features && wallet.features['standard:disconnect'];
+        if (dcFeature && typeof dcFeature.disconnect === 'function') {{
+          await dcFeature.disconnect.call(dcFeature);
+        }} else if (wallet._provider && typeof wallet._provider.disconnect === 'function') {{
+          await wallet._provider.disconnect();
+        }}
+      }} catch (_) {{}}  // Disconnect errors are non-fatal
+
       // Standard connect feature.  Bind `this` to the feature object so
       // wallet implementations that reference `this` internally work correctly.
       const connectFeature = wallet.features && wallet.features['standard:connect'];
@@ -5401,6 +5419,7 @@ def wallet_connect_webapp():
       }}, passed ? 1200 : 2500);
     }} else {{
       const $alert = document.getElementById('resultAlert');
+      const $rc = document.getElementById('resultCard');
       try {{
         const resp = await fetch(API_VERIFY_URL, {{
           method: 'POST',
@@ -5409,9 +5428,19 @@ def wallet_connect_webapp():
         }});
         const result = await resp.json();
         if (result.success) {{
+          $rc.innerHTML =
+            '<div class="result-icon">✅</div>' +
+            '<h2>Verification Passed!</h2>' +
+            '<p>Your wallet has been verified and registered.</p>';
           $alert.textContent = '✅ Wallet verified! Check Telegram for your confirmation and group invite link.';
           $alert.className = 'alert alert-success show';
         }} else {{
+          $rc.innerHTML =
+            '<div class="result-icon">❌</div>' +
+            '<h2>Verification Failed</h2>';
+          var errP = document.createElement('p');
+          errP.textContent = result.error || 'Your wallet does not currently meet the group\\'s requirements.';
+          $rc.appendChild(errP);
           $alert.textContent = '❌ ' + (result.error || 'Verification failed. Please try again.');
           $alert.className = 'alert alert-error show';
         }}
@@ -5532,22 +5561,12 @@ def api_verify():
         else:
             requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
 
-        if not requirement_eval['requirements_met']:
-            error_msg = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
-                requirement_eval['errors'] or ['Please retry after updating your holdings.']
-            )
-            if requirement_eval.get('details'):
-                error_msg += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval['details'])
-            try:
-                bot.send_message(tg_user_id, error_msg, parse_mode='Markdown')
-            except Exception:
-                pass
-            resp = jsonify({'success': False, 'error': 'Wallet does not meet group requirements', 'details': requirement_eval.get('errors', [])})
-            return _add_cors_headers(resp), 403
-
         # Resolve display name (best-effort)
         username = _get_user_display_name(tg_user_id)
 
+        # Always save / update the wallet so the user's database record
+        # reflects the current registration mode and wallet list, even when
+        # requirements are not met right now.
         success = save_wallet_for_user(group_id, tg_user_id, username, [wallet_address.lower()], replace_existing=False, registration_type=cfg.get("registration_mode", "token"))
         if not success:
             resp = jsonify({'success': False, 'error': 'Failed to save wallet. Please try again later.'})
@@ -5555,6 +5574,20 @@ def api_verify():
 
         with get_db_cursor() as (conn, cur):
             cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (tg_user_id,))
+
+        if not requirement_eval['requirements_met']:
+            error_msg = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
+                requirement_eval['errors'] or ['Please retry after updating your holdings.']
+            )
+            if requirement_eval.get('details'):
+                error_msg += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval['details'])
+            error_msg += "\n\n_Your wallet has been saved. You can re-verify at any time._"
+            try:
+                bot.send_message(tg_user_id, error_msg, parse_mode='Markdown')
+            except Exception:
+                pass
+            resp = jsonify({'success': False, 'error': 'Wallet does not meet group requirements', 'details': requirement_eval.get('errors', [])})
+            return _add_cors_headers(resp), 403
 
         # Send confirmation to user and notify the group
         try:
