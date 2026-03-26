@@ -2566,7 +2566,7 @@ def calculate_user_vote_weight(group_id, user_id):
 
         # Calculate NFT-based votes
         if nft_collection_id and votes_per_nft > 0:
-            nft_count = get_user_nft_count(wallet_addresses, nft_collection_id)
+            nft_count = get_user_nft_count(wallet_addresses, nft_collection_id) or 0
             nft_votes = nft_count * votes_per_nft
             total_weight += nft_votes
 
@@ -2812,12 +2812,21 @@ def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=
                 results.append(obj)
     except Exception as e:
         logging.error(f"Error fetching kiosk NFTs for collection {collection_id}: {e}")
+        # If no directly-owned NFTs were found, the kiosk failure is
+        # significant — all user NFTs may be inside kiosks.  Re-raise so
+        # callers know the count is unreliable.
+        if not results:
+            raise
 
     return results
 
 
-def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None):
-    """Count NFTs for addresses via on-chain Sui owned-object queries."""
+def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None, max_retries=2):
+    """Count NFTs for addresses via on-chain Sui owned-object queries.
+
+    Returns the integer count on success or ``None`` when the on-chain
+    lookup fails (so callers can distinguish "0 NFTs" from "RPC error").
+    """
     current_time = time.time()
     normalized_addresses = [addr.lower() for addr in addresses if addr]
     collection_hint = _normalize_collection_id(collection_id).lower()
@@ -2831,7 +2840,7 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None)
             return cache_result
 
     try:
-        nfts = _fetch_owned_nfts(normalized_addresses, collection_id)
+        nfts = _fetch_owned_nfts(normalized_addresses, collection_id, max_retries=max_retries)
         total_count = len(nfts)
 
         if len(nft_cache) >= MAX_CACHE_SIZE:
@@ -2844,11 +2853,13 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None)
 
     except Exception as e:
         logging.error(f"Error getting on-chain NFT count: {e}")
-        return 0
+        return None
 
 
 def check_nft_ownership(addresses, collection_id, threshold):
     total_nft_count = get_user_nft_count(addresses, collection_id)
+    if total_nft_count is None:
+        return False
     return total_nft_count >= threshold
 
 
@@ -2984,9 +2995,23 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
     trait_api_failed = False
 
     if registration_mode in ["nft", "both"] and nft_collection_id:
-        nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=use_cache_flag)
-        nft_valid = nft_count >= nft_threshold
-        details.append(f"*NFTs in Collection:* {nft_count} {'✓' if nft_valid else '✗'} (threshold: {nft_threshold})")
+        # Use more retries for interactive verification where the user is
+        # actively waiting and false negatives are costly.
+        rpc_retries = 4 if force_fresh else 2
+        nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=use_cache_flag, max_retries=rpc_retries)
+        # Retry once on RPC failure during interactive verification –
+        # transient errors (rate limits, kiosk fetch timeouts) can cause
+        # false negatives when the user's NFTs are inside SUI Kiosks.
+        if nft_count is None and force_fresh:
+            time.sleep(2)
+            logging.info(f"Retrying NFT count for wallet {wallet_lower} after initial RPC failure")
+            nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=False, max_retries=rpc_retries)
+        if nft_count is None:
+            errors.append("⚠️ Unable to verify NFT ownership right now. Please retry in a moment.")
+            details.append(f"*NFTs in Collection:* ⚠️ check failed (threshold: {nft_threshold})")
+        else:
+            nft_valid = nft_count >= nft_threshold
+            details.append(f"*NFTs in Collection:* {nft_count} {'✓' if nft_valid else '✗'} (threshold: {nft_threshold})")
 
         if nft_trait_name and nft_valid:
             try:
@@ -5576,8 +5601,9 @@ def api_verify():
             cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (tg_user_id,))
 
         if not requirement_eval['requirements_met']:
+            eval_errors = requirement_eval.get('errors', [])
             error_msg = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
-                requirement_eval['errors'] or ['Please retry after updating your holdings.']
+                eval_errors or ['Please retry after updating your holdings.']
             )
             if requirement_eval.get('details'):
                 error_msg += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval['details'])
@@ -5586,8 +5612,17 @@ def api_verify():
                 bot.send_message(tg_user_id, error_msg, parse_mode='Markdown')
             except Exception:
                 pass
-            resp = jsonify({'success': False, 'error': 'Wallet does not meet group requirements', 'details': requirement_eval.get('errors', [])})
-            return _add_cors_headers(resp), 403
+            # Provide a more specific error message to the frontend when the
+            # failure is due to an RPC error rather than a genuine shortfall.
+            rpc_error = any('Unable to verify' in e or 'check failed' in e for e in eval_errors)
+            if rpc_error:
+                resp_error = 'Unable to verify on-chain holdings right now. Please try again.'
+                status_code = 503
+            else:
+                resp_error = 'Wallet does not meet group requirements'
+                status_code = 403
+            resp = jsonify({'success': False, 'error': resp_error, 'details': eval_errors})
+            return _add_cors_headers(resp), status_code
 
         # Send confirmation to user and notify the group
         try:
