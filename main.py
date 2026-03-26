@@ -3775,17 +3775,17 @@ def build_wallet_connect_url(group_id, user_id, cfg=None):
         nft_collection_id = cfg.get("nft_collection_id", "")
         nft_threshold = cfg.get("nft_threshold", 1)
 
-        if token:
+        if registration_mode:
+            url += f"&registration_mode={registration_mode}"
+
+        if token and registration_mode in ("token", "both"):
             url += f"&token_type={quote(token, safe='')}"
             required_balance = int(round(minimum_holding * (10 ** decimals)))
             url += f"&required_balance={required_balance}"
             url += f"&decimals={decimals}"
             url += f"&minimum_holding={minimum_holding}"
 
-        if registration_mode:
-            url += f"&registration_mode={registration_mode}"
-
-        if nft_collection_id:
+        if nft_collection_id and registration_mode in ("nft", "both"):
             url += f"&nft_collection_id={quote(nft_collection_id, safe='')}"
             url += f"&nft_threshold={nft_threshold}"
 
