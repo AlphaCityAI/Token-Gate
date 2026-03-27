@@ -85,7 +85,9 @@ def _generate_verify_token(group_id, user_id):
     """
     ts = str(int(time.time()))
     msg = f"{group_id}:{user_id}:{ts}"
-    secret = (BOT_TOKEN or "fallback").encode("utf-8")
+    # BOT_TOKEN is required for the bot to start; this fallback is
+    # purely defensive and will never execute at runtime.
+    secret = (BOT_TOKEN or "").encode("utf-8")
     sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{msg}:{sig}"
 
@@ -114,7 +116,7 @@ def _validate_verify_token(token, group_id, user_id, max_age=None):
             return False
         if time.time() - int(tok_ts) > max_age:
             return False
-        secret = (BOT_TOKEN or "fallback").encode("utf-8")
+        secret = (BOT_TOKEN or "").encode("utf-8")
         expected_sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(sig, expected_sig)
     except Exception:
@@ -433,7 +435,6 @@ def init_db():
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_trait_count INTEGER DEFAULT NULL")
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_token_balance REAL DEFAULT NULL")
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS holdings_updated_at TIMESTAMP DEFAULT NULL")
-            pass
         except Exception as e:
             logging.error(f"Error adding new columns: {e}")
             conn.rollback()
@@ -461,7 +462,8 @@ def load_configs_from_db():
          nft_trait_name, nft_trait_value, nft_trait_threshold) = row
         try:
             wallets = json.loads(wallets_json) if wallets_json else {}
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Error parsing wallets JSON for chat {chat_id}: {e}")
             wallets = {}
         configs[chat_id] = {
             "token": token,
@@ -1068,8 +1070,8 @@ def check_user_wallets():
                                     nft_count=user_nft_count,
                                     trait_count=user_trait_count,
                                 )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logging.debug(f"Could not update cached holdings for user {user_id}: {e}")
                     
                     # Determine if user meets requirements based on registration_mode
                     user_meets_requirements = False
@@ -1106,7 +1108,7 @@ def check_user_wallets():
                     for user_id, total in below_users_to_alert:
                         try:
                             user_info = bot.get_chat_member(group_id, user_id).user
-                            username = user_info.username or user_info.first_name
+                            username = user_info.username or user_info.first_name or f"User{user_id}"
                         except Exception as e:
                             logging.error(f"Error retrieving info for user {user_id}: {e}")
                             username = f"User{user_id}"
@@ -1707,7 +1709,7 @@ def handle_verify_wallet_callback(call):
             )
             return
 
-        if time.time() - timestamp.timestamp() > VERIFICATION_TIMEOUT:
+        if not timestamp or time.time() - timestamp.timestamp() > VERIFICATION_TIMEOUT:
             with get_db_cursor() as (conn, cur):
                 cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
             bot.answer_callback_query(call.id, "Verification timed out")
@@ -3781,8 +3783,7 @@ def handle_chat_member_update(update):
 
                     token_valid = False
                     nft_valid = False
-
-                    # Check token requirements if applicable
+                    trait_valid = True  # Defaults to True; trait enforcement only in evaluate_wallet_requirements
                     if registration_mode in ["token", "both"] and token:
                         balances = fetch_wallet_balances(wallet_addresses, token, decimals)
                         total_balance = sum(balances.get(addr, 0) or 0 for addr in wallet_addresses)
@@ -3797,9 +3798,9 @@ def handle_chat_member_update(update):
                     if registration_mode == "token":
                         requirements_met = token_valid
                     elif registration_mode == "nft":
-                        requirements_met = nft_valid
+                        requirements_met = nft_valid and trait_valid
                     elif registration_mode == "both":
-                        requirements_met = token_valid or nft_valid
+                        requirements_met = token_valid or (nft_valid and trait_valid)
 
                     # If requirements are met, user is valid - no prompt needed
                     if requirements_met:
@@ -3854,8 +3855,8 @@ def handle_chat_member_update(update):
                     time.sleep(300)  # 5 minutes
                     try:
                         bot.delete_message(group_id, sent_message.message_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.debug(f"Could not auto-delete welcome message in group {group_id}: {e}")
 
                 threading.Thread(target=delete_welcome, daemon=True).start()
 
@@ -3971,7 +3972,6 @@ def handle_start(message):
         bot.reply_to(message, "Welcome!")
 
 # New command handler for /confirm
-# New command handler for /confirm
 @db_retry
 @bot.message_handler(commands=['confirm'])
 def confirm_verification(message):
@@ -3993,7 +3993,7 @@ def confirm_verification(message):
             cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
         return
 
-    if time.time() - timestamp.timestamp() > VERIFICATION_TIMEOUT:
+    if not timestamp or time.time() - timestamp.timestamp() > VERIFICATION_TIMEOUT:
         with get_db_cursor() as (conn, cur):
             cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
         bot.reply_to(message, "❌ Verification timed out.\n\nPlease use /register to start the verification process again.")
@@ -4009,10 +4009,10 @@ def confirm_verification(message):
             return
 
         requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
-        if not requirement_eval["requirements_met"]:
-            error_text = "❌ *Wallet Requirements Not Met*\n\n" + "\n".join(requirement_eval["errors"] or ["Please retry after updating your holdings."])
-            if requirement_eval["details"]:
-                error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
+        if not requirement_eval.get("requirements_met"):
+            error_text = "❌ *Wallet Requirements Not Met*\n\n" + "\n".join(requirement_eval.get("errors") or ["Please retry after updating your holdings."])
+            if requirement_eval.get("details"):
+                error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval.get("details", []))
             bot.edit_message_text(
                 error_text,
                 chat_id=message.chat.id,
@@ -4062,8 +4062,8 @@ def confirm_verification(message):
         logging.error(f"Error during confirmation: {e}")
         try:
             bot.edit_message_text("❌ Error confirming verification. Please try again later.", chat_id=message.chat.id, message_id=processing_msg.message_id)
-        except Exception:
-            pass
+        except Exception as inner_e:
+            logging.debug(f"Could not send error message to user {user_id}: {inner_e}")
 
 def build_wallet_connect_url(group_id, user_id, cfg=None):
     """Build a verification URL for the built-in Telegram mini-app.
@@ -4316,18 +4316,18 @@ def handle_wallet_webapp_data(message):
     if _nft is not None or _trait is not None or _bal is not None:
         try:
             update_user_cached_holdings(group_id, user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug(f"Could not update cached holdings for user {user_id}: {e}")
 
     with get_db_cursor() as (conn, cur):
         cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (user_id,))
 
-    if not requirement_eval["requirements_met"]:
+    if not requirement_eval.get("requirements_met"):
         error_text = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
-            requirement_eval["errors"] or ["Please retry after updating your holdings."]
+            requirement_eval.get("errors") or ["Please retry after updating your holdings."]
         )
-        if requirement_eval["details"]:
-            error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
+        if requirement_eval.get("details"):
+            error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval.get("details", []))
         error_text += "\n\n_Your wallet has been saved. You can re-verify at any time._"
         bot.reply_to(message, error_text, parse_mode="Markdown")
         return
@@ -5860,8 +5860,8 @@ def api_verify():
         if _nft is not None or _trait is not None or _bal is not None:
             try:
                 update_user_cached_holdings(group_id, tg_user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
-            except Exception:
-                pass
+            except Exception as e:
+                logging.debug(f"Could not update cached holdings for user {tg_user_id}: {e}")
 
         with get_db_cursor() as (conn, cur):
             cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (tg_user_id,))
@@ -5876,8 +5876,8 @@ def api_verify():
             error_msg += "\n\n_Your wallet has been saved. You can re-verify at any time._"
             try:
                 bot.send_message(tg_user_id, error_msg, parse_mode='Markdown')
-            except Exception:
-                pass
+            except Exception as e:
+                logging.debug(f"api_verify: could not send requirement error to user {tg_user_id}: {e}")
             # Provide a more specific error message to the frontend when the
             # failure is due to an RPC error rather than a genuine shortfall.
             if requirement_eval.get('rpc_failed'):
