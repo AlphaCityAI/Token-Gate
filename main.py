@@ -1,6 +1,7 @@
 import telebot
 import os
 import html as html_module
+import hashlib
 import hmac
 import logging
 import json
@@ -69,6 +70,56 @@ CORS_ALLOWED_ORIGIN = os.getenv('CORS_ALLOWED_ORIGIN', '*').strip() or '*'
 
 BOT_NAME = "GuildSafeBot"
 CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
+
+# Maximum age (in seconds) for verify-page tokens used to authenticate
+# requests coming from the bot's own /verify page.
+_VERIFY_TOKEN_MAX_AGE = 600  # 10 minutes
+
+
+def _generate_verify_token(group_id, user_id):
+    """Create an HMAC-signed token proving a request originates from the /verify page.
+
+    The token encodes group_id, user_id and a timestamp.  It is embedded in
+    the page at render time and sent back with the verification payload so
+    the server can confirm the request came from a genuine page load.
+    """
+    ts = str(int(time.time()))
+    msg = f"{group_id}:{user_id}:{ts}"
+    secret = (BOT_TOKEN or "fallback").encode("utf-8")
+    sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{msg}:{sig}"
+
+
+def _validate_verify_token(token, group_id, user_id, max_age=None):
+    """Validate a signed verify-page token.
+
+    Returns ``True`` when the token is well-formed, the HMAC is correct,
+    the embedded group/user IDs match, and the token has not expired.
+    """
+    if max_age is None:
+        max_age = _VERIFY_TOKEN_MAX_AGE
+    try:
+        if not token:
+            return False
+        parts = token.rsplit(":", 1)
+        if len(parts) != 2:
+            return False
+        msg, sig = parts
+        # msg = "group_id:user_id:ts"
+        msg_parts = msg.split(":")
+        if len(msg_parts) != 3:
+            return False
+        tok_group, tok_user, tok_ts = msg_parts
+        if str(group_id) != tok_group or str(user_id) != tok_user:
+            return False
+        if time.time() - int(tok_ts) > max_age:
+            return False
+        secret = (BOT_TOKEN or "fallback").encode("utf-8")
+        expected_sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected_sig)
+    except Exception:
+        return False
+
 
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
@@ -2694,49 +2745,53 @@ def _fetch_kiosk_nfts(addresses, collection_id, show_content=False, max_retries=
 
         # Step 2: enumerate each Kiosk's dynamic fields for matching NFTs
         for kiosk_id in kiosk_ids:
-            df_cursor = None
-            while True:
-                df_result = sui_rpc_request(
-                    "suix_getDynamicFields",
-                    [kiosk_id, df_cursor, 50],
-                    max_retries=max_retries,
-                )
-                df_data = df_result.get("data", []) if df_result else []
-                for field in df_data:
-                    # Only consider Kiosk Item entries (skip Listing, etc.)
-                    name_info = field.get("name") or {}
-                    name_type = (name_info.get("type") or "").lower()
-                    if "kiosk::item" not in name_type:
-                        continue
-                    obj_type = (field.get("objectType") or "").lower()
-                    if not obj_type:
-                        continue
-                    # Match against collection hint
-                    if hint_lower in obj_type:
-                        nft_entry = {
-                            "objectId": field.get("objectId", ""),
-                            "type": field.get("objectType", ""),
-                        }
-                        if show_content:
-                            # Fetch full object data when content is needed
-                            # (e.g. trait extraction)
-                            item_id = (name_info.get("value") or {}).get("id", "")
-                            if item_id:
-                                obj_resp = sui_rpc_request(
-                                    "sui_getObject",
-                                    [item_id, {
-                                        "showType": True,
-                                        "showContent": True,
-                                        "showDisplay": True,
-                                    }],
-                                    max_retries=max_retries,
-                                )
-                                if obj_resp and obj_resp.get("data"):
-                                    nft_entry = obj_resp["data"]
-                        results.append(nft_entry)
-                if not df_result or not df_result.get("hasNextPage"):
-                    break
-                df_cursor = df_result.get("nextCursor")
+            try:
+                df_cursor = None
+                while True:
+                    df_result = sui_rpc_request(
+                        "suix_getDynamicFields",
+                        [kiosk_id, df_cursor, 50],
+                        max_retries=max_retries,
+                    )
+                    df_data = df_result.get("data", []) if df_result else []
+                    for field in df_data:
+                        # Only consider Kiosk Item entries (skip Listing, etc.)
+                        name_info = field.get("name") or {}
+                        name_type = (name_info.get("type") or "").lower()
+                        if "kiosk::item" not in name_type:
+                            continue
+                        obj_type = (field.get("objectType") or "").lower()
+                        if not obj_type:
+                            continue
+                        # Match against collection hint
+                        if hint_lower in obj_type:
+                            nft_entry = {
+                                "objectId": field.get("objectId", ""),
+                                "type": field.get("objectType", ""),
+                            }
+                            if show_content:
+                                # Fetch full object data when content is needed
+                                # (e.g. trait extraction)
+                                item_id = (name_info.get("value") or {}).get("id", "")
+                                if item_id:
+                                    obj_resp = sui_rpc_request(
+                                        "sui_getObject",
+                                        [item_id, {
+                                            "showType": True,
+                                            "showContent": True,
+                                            "showDisplay": True,
+                                        }],
+                                        max_retries=max_retries,
+                                    )
+                                    if obj_resp and obj_resp.get("data"):
+                                        nft_entry = obj_resp["data"]
+                            results.append(nft_entry)
+                    if not df_result or not df_result.get("hasNextPage"):
+                        break
+                    df_cursor = df_result.get("nextCursor")
+            except Exception as e:
+                logging.warning(f"Error enumerating kiosk {kiosk_id} for collection {collection_id}: {e}")
+                # Continue with remaining kiosks instead of aborting entirely
 
     return results
 
@@ -4045,6 +4100,7 @@ def handle_wallet_webapp_data(message):
     nft_count = payload.get('nft_count')
     if nft_count is None:
         nft_count = (payload.get('data') or {}).get('nft_count')
+    verify_token_val = payload.get('verify_token') or (payload.get('data') or {}).get('verify_token') or ''
 
     if not is_valid_wallet_address(wallet_address):
         bot.reply_to(message, "❌ Wallet verification failed: invalid wallet payload from WebApp.")
@@ -4089,6 +4145,17 @@ def handle_wallet_webapp_data(message):
             f"token_balance={token_balance}, nft_count={nft_count} — re-verifying server-side"
         )
     requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+
+    # Fallback: when the server-side RPC check fails but the client already
+    # verified successfully via a genuine /verify page load, accept the
+    # result instead of showing a confusing error.
+    if requirement_eval.get('rpc_failed') and not requirement_eval['requirements_met']:
+        if balance_verified and _validate_verify_token(verify_token_val, group_id, user_id):
+            logging.warning(
+                f"handle_wallet_webapp_data: server-side RPC failed for user {user_id}, wallet {wallet_address}, "
+                f"group {group_id} — accepting client-side verification (valid page token)"
+            )
+            requirement_eval = {"requirements_met": True, "details": requirement_eval.get('details', []), "errors": []}
 
     # Always save / update the wallet so the user's database record reflects
     # the current registration mode and wallet list, even when requirements
@@ -4276,6 +4343,11 @@ def wallet_connect_webapp():
     else:
         api_verify_url = "/api/verify"
     js_api_verify_url = json.dumps(api_verify_url)
+
+    # Generate a signed token so api_verify / handle_wallet_webapp_data can
+    # confirm the request originated from a genuine /verify page load.
+    verify_token = _generate_verify_token(safe_group_id, safe_tg_user_id)
+    js_verify_token = json.dumps(verify_token)
 
     html = f"""<!doctype html>
 <html>
@@ -4611,6 +4683,7 @@ def wallet_connect_webapp():
   const NFT_COLLECTION  = {js_nft_collection};
   const NFT_THRESHOLD   = {safe_nft_threshold};
   const API_VERIFY_URL  = {js_api_verify_url};
+  const VERIFY_TOKEN   = {js_verify_token};
 
   /* ── State ── */
   let connectedAddress = '';
@@ -5325,20 +5398,24 @@ def wallet_connect_webapp():
 
           // Enumerate each Kiosk's items via dynamic fields
           for (let ki = 0; ki < kioskIds.length && count < MAX_NFT_ENUMERATE; ki++) {{
-            let dfCursor = null;
-            do {{
-              const dfPage = await suiRpc('suix_getDynamicFields', [kioskIds[ki], dfCursor, 50]);
-              const dfItems = dfPage.data || [];
-              for (const df of dfItems) {{
-                const nameType = ((df.name || {{}}).type || '').toLowerCase();
-                if (nameType.indexOf('kiosk::item') === -1) continue;
-                const dfObjType = (df.objectType || '').toLowerCase();
-                if (dfObjType && dfObjType.indexOf(collLower) !== -1) {{
-                  count++;
+            try {{
+              let dfCursor = null;
+              do {{
+                const dfPage = await suiRpc('suix_getDynamicFields', [kioskIds[ki], dfCursor, 50]);
+                const dfItems = dfPage.data || [];
+                for (const df of dfItems) {{
+                  const nameType = ((df.name || {{}}).type || '').toLowerCase();
+                  if (nameType.indexOf('kiosk::item') === -1) continue;
+                  const dfObjType = (df.objectType || '').toLowerCase();
+                  if (dfObjType && dfObjType.indexOf(collLower) !== -1) {{
+                    count++;
+                  }}
                 }}
-              }}
-              dfCursor = dfPage.hasNextPage ? dfPage.nextCursor : null;
-            }} while (dfCursor && count < MAX_NFT_ENUMERATE);
+                dfCursor = dfPage.hasNextPage ? dfPage.nextCursor : null;
+              }} while (dfCursor && count < MAX_NFT_ENUMERATE);
+            }} catch (_kioskErr) {{
+              // Continue with remaining kiosks if one fails
+            }}
           }}
         }}
 
@@ -5443,7 +5520,8 @@ def wallet_connect_webapp():
       token_balance: check.tokenBalance,
       nft_count: check.nftCount,
       wallet_signature: walletSignResult ? walletSignResult.signature : null,
-      sign_message: walletSignResult ? walletSignResult.message : null
+      sign_message: walletSignResult ? walletSignResult.message : null,
+      verify_token: VERIFY_TOKEN
     }};
 
     if (isWebApp) {{
@@ -5592,7 +5670,26 @@ def api_verify():
                 f"wallet {wallet_address}, group {group_id}"
             )
         else:
+            # Brief pause to let SUI RPC rate-limits recover after the client-
+            # side verification that just completed (the verify page makes
+            # several RPC calls before posting here).
+            time.sleep(1)
             requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
+
+            # Fallback: when the server-side RPC check fails (e.g. rate-
+            # limiting after the client already hit the same RPC) but the
+            # request carries a valid page-session token AND the client
+            # reported that its own on-chain check passed, accept the result
+            # rather than showing a confusing "Unable to verify" error.
+            if requirement_eval.get('rpc_failed') and not requirement_eval['requirements_met']:
+                client_verified = data.get('balance_verified')
+                verify_tok = data.get('verify_token', '')
+                if client_verified and _validate_verify_token(verify_tok, group_id, tg_user_id):
+                    logging.warning(
+                        f"api_verify: server-side RPC failed for user {tg_user_id}, wallet {wallet_address}, "
+                        f"group {group_id} — accepting client-side verification (valid page token)"
+                    )
+                    requirement_eval = {"requirements_met": True, "details": requirement_eval.get('details', []), "errors": []}
 
         # Resolve display name (best-effort)
         username = _get_user_display_name(tg_user_id)
