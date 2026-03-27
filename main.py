@@ -660,7 +660,24 @@ def get_user_registrations_for_group(group_id):
 @db_retry
 def update_user_cached_holdings(group_id, user_id, nft_count=None, trait_count=None, token_balance=None):
     """Persist last-known on-chain holdings so display functions can fall back
-    to them when live RPC lookups fail."""
+    to them when live RPC lookups fail.
+
+    Parameters
+    ----------
+    group_id : int
+        Telegram group/chat ID.
+    user_id : int
+        Telegram user ID.
+    nft_count : int or None
+        Last successful NFT count across all user wallets.
+    trait_count : int or None
+        Last successful trait-matching NFT count.
+    token_balance : float or None
+        Last successful aggregate token balance.
+
+    Only non-None values are written; the rest remain unchanged.  If every
+    optional parameter is None the function returns without touching the DB.
+    """
     updates = []
     params = []
     if nft_count is not None:
@@ -676,6 +693,8 @@ def update_user_cached_holdings(group_id, user_id, nft_count=None, trait_count=N
         return
     updates.append("holdings_updated_at = NOW()")
     params.extend([group_id, user_id])
+    # Safety: the SET clause is built from a fixed set of hard-coded column
+    # literals above — no external input is interpolated into the SQL.
     with get_db_cursor() as (conn, cur):
         cur.execute(
             f"UPDATE user_wallets SET {', '.join(updates)} WHERE group_id = %s AND user_id = %s",
@@ -684,7 +703,21 @@ def update_user_cached_holdings(group_id, user_id, nft_count=None, trait_count=N
 
 @db_retry
 def get_user_cached_holdings(group_id, user_id):
-    """Retrieve previously cached on-chain holdings for a user."""
+    """Retrieve previously cached on-chain holdings for a user.
+
+    Parameters
+    ----------
+    group_id : int
+        Telegram group/chat ID.
+    user_id : int
+        Telegram user ID.
+
+    Returns
+    -------
+    dict or None
+        ``{"nft_count": int|None, "trait_count": int|None, "token_balance": float|None}``
+        if a row exists, otherwise ``None``.
+    """
     with get_db_cursor() as (conn, cur):
         cur.execute(
             "SELECT last_nft_count, last_trait_count, last_token_balance FROM user_wallets WHERE group_id = %s AND user_id = %s",
@@ -1019,10 +1052,9 @@ def check_user_wallets():
                                     user_trait_count = get_user_nft_category_count(
                                         user_wallets_lower, nft_collection_id, nft_trait_name
                                     )
-                                trait_check_result = user_trait_count
-                                if trait_check_result is not None and trait_check_result < nft_trait_threshold:
+                                if user_trait_count is not None and user_trait_count < nft_trait_threshold:
                                     trait_valid = False
-                                    logging.info(f"User {user_id} fails trait check: {trait_check_result} < {nft_trait_threshold}")
+                                    logging.info(f"User {user_id} fails trait check: {user_trait_count} < {nft_trait_threshold}")
                             except Exception as trait_e:
                                 logging.warning(f"Trait check API error for user {user_id}, skipping trait enforcement: {trait_e}")
                                 trait_valid = True  # Safety: don't penalize on API failure
