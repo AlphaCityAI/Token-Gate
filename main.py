@@ -429,6 +429,10 @@ def init_db():
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_trait_name TEXT DEFAULT ''")
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_trait_value TEXT DEFAULT ''")
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_trait_threshold INTEGER DEFAULT 1")
+            cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_nft_count INTEGER DEFAULT NULL")
+            cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_trait_count INTEGER DEFAULT NULL")
+            cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_token_balance REAL DEFAULT NULL")
+            cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS holdings_updated_at TIMESTAMP DEFAULT NULL")
             pass
         except Exception as e:
             logging.error(f"Error adding new columns: {e}")
@@ -652,6 +656,44 @@ def get_user_registrations_for_group(group_id):
             "is_exempt": is_exempt
         })
     return registrations
+
+@db_retry
+def update_user_cached_holdings(group_id, user_id, nft_count=None, trait_count=None, token_balance=None):
+    """Persist last-known on-chain holdings so display functions can fall back
+    to them when live RPC lookups fail."""
+    updates = []
+    params = []
+    if nft_count is not None:
+        updates.append("last_nft_count = %s")
+        params.append(nft_count)
+    if trait_count is not None:
+        updates.append("last_trait_count = %s")
+        params.append(trait_count)
+    if token_balance is not None:
+        updates.append("last_token_balance = %s")
+        params.append(token_balance)
+    if not updates:
+        return
+    updates.append("holdings_updated_at = NOW()")
+    params.extend([group_id, user_id])
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            f"UPDATE user_wallets SET {', '.join(updates)} WHERE group_id = %s AND user_id = %s",
+            tuple(params),
+        )
+
+@db_retry
+def get_user_cached_holdings(group_id, user_id):
+    """Retrieve previously cached on-chain holdings for a user."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT last_nft_count, last_trait_count, last_token_balance FROM user_wallets WHERE group_id = %s AND user_id = %s",
+            (group_id, user_id),
+        )
+        result = cur.fetchone()
+        if result:
+            return {"nft_count": result[0], "trait_count": result[1], "token_balance": result[2]}
+    return None
 
 @db_retry
 def wallet_already_registered(wallet_address, group_id, user_id=None):
@@ -952,6 +994,8 @@ def check_user_wallets():
                     # Check NFT holdings (collection + optional traits)
                     nft_valid = False
                     trait_valid = True
+                    user_nft_count = None
+                    user_trait_count = None
                     if registration_mode in ["nft", "both"] and nft_collection_id:
                         try:
                             user_nft_count = get_user_nft_count(user_wallets_lower, nft_collection_id)
@@ -968,19 +1012,32 @@ def check_user_wallets():
                         if nft_valid and nft_trait_name:
                             try:
                                 if nft_trait_value:
-                                    trait_check_result = get_user_nft_trait_count(
+                                    user_trait_count = get_user_nft_trait_count(
                                         user_wallets_lower, nft_collection_id, nft_trait_name, nft_trait_value
                                     )
                                 else:
-                                    trait_check_result = get_user_nft_category_count(
+                                    user_trait_count = get_user_nft_category_count(
                                         user_wallets_lower, nft_collection_id, nft_trait_name
                                     )
+                                trait_check_result = user_trait_count
                                 if trait_check_result is not None and trait_check_result < nft_trait_threshold:
                                     trait_valid = False
                                     logging.info(f"User {user_id} fails trait check: {trait_check_result} < {nft_trait_threshold}")
                             except Exception as trait_e:
                                 logging.warning(f"Trait check API error for user {user_id}, skipping trait enforcement: {trait_e}")
                                 trait_valid = True  # Safety: don't penalize on API failure
+
+                        # Persist successful on-chain results so display
+                        # functions can fall back to them on RPC failure.
+                        if user_nft_count is not None or user_trait_count is not None:
+                            try:
+                                update_user_cached_holdings(
+                                    group_id, user_id,
+                                    nft_count=user_nft_count,
+                                    trait_count=user_trait_count,
+                                )
+                            except Exception:
+                                pass
                     
                     # Determine if user meets requirements based on registration_mode
                     user_meets_requirements = False
@@ -1982,6 +2039,20 @@ def show_mywallets_private(chat_id, group_id):
                 except Exception as e:
                     logging.error(f"Error getting NFT count in show_mywallets_private: {e}")
 
+                # Persist successful result or fall back to cached data
+                if user_nft_count is not None:
+                    try:
+                        update_user_cached_holdings(group_id, user_id, nft_count=user_nft_count)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        cached = get_user_cached_holdings(group_id, user_id)
+                        if cached and cached.get("nft_count") is not None:
+                            user_nft_count = cached["nft_count"]
+                    except Exception:
+                        pass
+
             # Fetch trait count
             user_trait_count = None
             if has_trait and user_nft_count is not None and user_nft_count > 0:
@@ -1993,6 +2064,20 @@ def show_mywallets_private(chat_id, group_id):
                         user_trait_count = get_user_nft_category_count(user_wallets_lower, nft_collection_id, nft_trait_name)
                 except Exception as e:
                     logging.error(f"Error getting NFT trait count in show_mywallets_private: {e}")
+
+                # Persist successful result or fall back to cached data
+                if user_trait_count is not None:
+                    try:
+                        update_user_cached_holdings(group_id, user_id, trait_count=user_trait_count)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        cached = get_user_cached_holdings(group_id, user_id)
+                        if cached and cached.get("trait_count") is not None:
+                            user_trait_count = cached["trait_count"]
+                    except Exception:
+                        pass
 
             # Build wallet information message
             message_lines = [
@@ -2169,6 +2254,20 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
                     logging.error(f"Error getting NFT count for user {username}: {e}")
                     user_nft_count = None
 
+                # Persist successful result or fall back to cached data
+                if user_nft_count is not None:
+                    try:
+                        update_user_cached_holdings(group_id, reg["user_id"], nft_count=user_nft_count)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        cached = get_user_cached_holdings(group_id, reg["user_id"])
+                        if cached and cached.get("nft_count") is not None:
+                            user_nft_count = cached["nft_count"]
+                    except Exception:
+                        pass
+
                 # NFT trait count check
                 if has_trait and user_nft_count is not None and user_nft_count > 0:
                     try:
@@ -2180,6 +2279,20 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
                     except Exception as e:
                         logging.error(f"Error getting NFT trait count for user {username}: {e}")
                         user_trait_count = None
+
+                    # Persist successful result or fall back to cached data
+                    if user_trait_count is not None:
+                        try:
+                            update_user_cached_holdings(group_id, reg["user_id"], trait_count=user_trait_count)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            cached = get_user_cached_holdings(group_id, reg["user_id"])
+                            if cached and cached.get("trait_count") is not None:
+                                user_trait_count = cached["trait_count"]
+                        except Exception:
+                            pass
 
         if wallet_lines:
             wallet_text = "\n".join(wallet_lines)
@@ -3219,6 +3332,9 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
         "details": details,
         "errors": errors,
         "rpc_failed": rpc_failed,
+        "nft_count": nft_count,
+        "trait_count": trait_count,
+        "token_balance": token_balance,
     }
 
 @db_retry
@@ -4153,6 +4269,23 @@ def handle_wallet_webapp_data(message):
     if not success:
         bot.reply_to(message, "❌ Failed to save your wallet. Please try again later.")
         return
+
+    # Persist any on-chain counts returned by the requirement evaluation
+    # (or from the client-side payload when the fallback was used) so the
+    # "View Wallets" display has data even when later RPC lookups fail.
+    _nft = requirement_eval.get("nft_count")
+    _trait = requirement_eval.get("trait_count")
+    _bal = requirement_eval.get("token_balance")
+    if _nft is None and nft_count is not None:
+        try:
+            _nft = int(nft_count)
+        except (ValueError, TypeError):
+            pass
+    if _nft is not None or _trait is not None or _bal is not None:
+        try:
+            update_user_cached_holdings(group_id, user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
+        except Exception:
+            pass
 
     with get_db_cursor() as (conn, cur):
         cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (user_id,))
@@ -5678,6 +5811,25 @@ def api_verify():
         if not success:
             resp = jsonify({'success': False, 'error': 'Failed to save wallet. Please try again later.'})
             return _add_cors_headers(resp), 500
+
+        # Persist any on-chain counts returned by the requirement evaluation
+        # (or from the client-side payload when the fallback was used) so the
+        # "View Wallets" display has data even when later RPC lookups fail.
+        _nft = requirement_eval.get("nft_count")
+        _trait = requirement_eval.get("trait_count")
+        _bal = requirement_eval.get("token_balance")
+        # When server-side RPC failed but client payload was accepted via the
+        # verify-token fallback, use the client-reported nft_count instead.
+        if _nft is None and data.get("nft_count") is not None:
+            try:
+                _nft = int(data["nft_count"])
+            except (ValueError, TypeError):
+                pass
+        if _nft is not None or _trait is not None or _bal is not None:
+            try:
+                update_user_cached_holdings(group_id, tg_user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
+            except Exception:
+                pass
 
         with get_db_cursor() as (conn, cur):
             cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (tg_user_id,))
