@@ -85,6 +85,8 @@ def _generate_verify_token(group_id, user_id):
     """
     ts = str(int(time.time()))
     msg = f"{group_id}:{user_id}:{ts}"
+    # BOT_TOKEN is required for the bot to start; this fallback is
+    # purely defensive and will never execute at runtime.
     secret = (BOT_TOKEN or "").encode("utf-8")
     sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{msg}:{sig}"
@@ -3781,7 +3783,7 @@ def handle_chat_member_update(update):
 
                     token_valid = False
                     nft_valid = False
-                    trait_valid = True  # Default to True; full trait checks happen in evaluate_wallet_requirements
+                    trait_valid = True  # Defaults to True; trait enforcement only in evaluate_wallet_requirements
                     if registration_mode in ["token", "both"] and token:
                         balances = fetch_wallet_balances(wallet_addresses, token, decimals)
                         total_balance = sum(balances.get(addr, 0) or 0 for addr in wallet_addresses)
