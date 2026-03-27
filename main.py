@@ -1949,9 +1949,19 @@ def show_mywallets_private(chat_id, group_id):
         with config_lock:
             config = SUBSCRIBER_CONFIGS.get(group_id, {})
 
+        registration_mode = config.get("registration_mode", "token")
         token = config.get("token", "")
         decimals = config.get("decimals", 6)
         minimum_holding = config.get("minimum_holding", 0)
+        nft_collection_id = config.get("nft_collection_id", "")
+        nft_threshold = config.get("nft_threshold", 1)
+        nft_trait_name = config.get("nft_trait_name", "")
+        nft_trait_value = config.get("nft_trait_value", "")
+        nft_trait_threshold = config.get("nft_trait_threshold", 1)
+
+        has_token = bool(token) and registration_mode in ["token", "both"]
+        has_nft = bool(nft_collection_id) and registration_mode in ["nft", "both"]
+        has_trait = has_nft and bool(nft_trait_name)
 
         # Show processing message
         processing_msg = bot.send_message(chat_id, f"⏳ Loading your wallet information for {group_name}...")
@@ -1959,9 +1969,30 @@ def show_mywallets_private(chat_id, group_id):
         try:
             # Fetch balances for all wallets
             wallet_balances = {}
-            if token:
+            if has_token:
                 balances = fetch_wallet_balances(wallets, token, decimals)
                 wallet_balances = balances
+
+            # Fetch NFT count
+            user_nft_count = None
+            if has_nft:
+                try:
+                    user_wallets_lower = [w.lower() for w in wallets]
+                    user_nft_count = get_user_nft_count(user_wallets_lower, nft_collection_id)
+                except Exception as e:
+                    logging.error(f"Error getting NFT count in show_mywallets_private: {e}")
+
+            # Fetch trait count
+            user_trait_count = None
+            if has_trait and user_nft_count is not None and user_nft_count > 0:
+                try:
+                    user_wallets_lower = [w.lower() for w in wallets]
+                    if nft_trait_value:
+                        user_trait_count = get_user_nft_trait_count(user_wallets_lower, nft_collection_id, nft_trait_name, nft_trait_value)
+                    else:
+                        user_trait_count = get_user_nft_category_count(user_wallets_lower, nft_collection_id, nft_trait_name)
+                except Exception as e:
+                    logging.error(f"Error getting NFT trait count in show_mywallets_private: {e}")
 
             # Build wallet information message
             message_lines = [
@@ -1970,22 +2001,43 @@ def show_mywallets_private(chat_id, group_id):
 
             total_balance = 0
             for i, wallet in enumerate(wallets):
-                balance = wallet_balances.get(wallet.lower(), 0) or 0
-                total_balance += balance
-
                 # Truncate wallet address for display
                 display_wallet = f"{wallet[:8]}...{wallet[-6:]}"
-                status_emoji = "✅" if balance >= minimum_holding else "⚠️"
 
-                message_lines.append(f"{status_emoji} `{display_wallet}`")
-                if token:
+                if has_token:
+                    balance = wallet_balances.get(wallet.lower(), 0) or 0
+                    total_balance += balance
+                    status_emoji = "✅" if balance >= minimum_holding else "⚠️"
+                    message_lines.append(f"{status_emoji} `{display_wallet}`")
                     message_lines.append(f"    Balance: {balance:,.2f} tokens")
+                else:
+                    message_lines.append(f"📱 `{display_wallet}`")
                 message_lines.append("")
 
-            if token:
+            # Token summary
+            if has_token:
                 threshold_status = "✅ Above" if total_balance >= minimum_holding else "❌ Below"
                 message_lines.append(f"*Total Balance:* {total_balance:,.2f} tokens")
-                message_lines.append(f"*Threshold Status:* {threshold_status} threshold ({minimum_holding:,.2f})")
+                message_lines.append(f"*Token Status:* {threshold_status} threshold ({minimum_holding:,.2f})")
+
+            # NFT summary
+            if has_nft:
+                if user_nft_count is not None:
+                    nft_status = "✅ Above" if user_nft_count >= nft_threshold else "❌ Below"
+                    message_lines.append(f"*NFTs in Collection:* {user_nft_count}")
+                    message_lines.append(f"*NFT Status:* {nft_status} threshold ({nft_threshold})")
+                else:
+                    message_lines.append(f"*NFTs in Collection:* N/A")
+
+            # Trait summary
+            if has_trait:
+                trait_label = f"{nft_trait_name}={nft_trait_value}" if nft_trait_value else f"{nft_trait_name} (any value)"
+                if user_trait_count is not None:
+                    trait_status = "✅ Above" if user_trait_count >= nft_trait_threshold else "❌ Below"
+                    message_lines.append(f"*Trait ({trait_label}):* {user_trait_count}")
+                    message_lines.append(f"*Trait Status:* {trait_status} threshold ({nft_trait_threshold})")
+                elif user_nft_count is not None:
+                    message_lines.append(f"*Trait ({trait_label}):* N/A")
 
             # Create inline keyboard for wallet management
             markup = types.InlineKeyboardMarkup()
@@ -2047,10 +2099,14 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
     threshold = cfg.get("minimum_holding", 0)
     nft_collection_id = cfg.get("nft_collection_id", "")
     nft_threshold = cfg.get("nft_threshold", 1)
+    nft_trait_name = cfg.get("nft_trait_name", "")
+    nft_trait_value = cfg.get("nft_trait_value", "")
+    nft_trait_threshold = cfg.get("nft_trait_threshold", 1)
 
     # Validate that at least one gating criterion is configured
     has_token = bool(token) and registration_mode in ["token", "both"]
     has_nft = bool(nft_collection_id) and registration_mode in ["nft", "both"]
+    has_trait = has_nft and bool(nft_trait_name)
     if not has_token and not has_nft:
         if processing_msg:
              bot.edit_message_text("No token or NFT gating configured for this group.", chat_id=target_chat_id, message_id=processing_msg.message_id)
@@ -2090,6 +2146,7 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
         total_balance = 0.0
         balance_complete = True
         user_nft_count = None
+        user_trait_count = None
 
         if not exempt and wallets:
             # Token balance check
@@ -2112,6 +2169,18 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
                     logging.error(f"Error getting NFT count for user {username}: {e}")
                     user_nft_count = None
 
+                # NFT trait count check
+                if has_trait and user_nft_count is not None and user_nft_count > 0:
+                    try:
+                        user_wallets_lower = [w.lower() for w in wallets]
+                        if nft_trait_value:
+                            user_trait_count = get_user_nft_trait_count(user_wallets_lower, nft_collection_id, nft_trait_name, nft_trait_value)
+                        else:
+                            user_trait_count = get_user_nft_category_count(user_wallets_lower, nft_collection_id, nft_trait_name)
+                    except Exception as e:
+                        logging.error(f"Error getting NFT trait count for user {username}: {e}")
+                        user_trait_count = None
+
         if wallet_lines:
             wallet_text = "\n".join(wallet_lines)
         elif not has_token and wallets:
@@ -2131,6 +2200,12 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
                 holdings_parts.append(f"{user_nft_count} NFTs")
             elif not exempt and wallets:
                 holdings_parts.append("NFTs: N/A")
+        if has_trait:
+            trait_label = f"{nft_trait_name}={nft_trait_value}" if nft_trait_value else f"{nft_trait_name}"
+            if user_trait_count is not None:
+                holdings_parts.append(f"{user_trait_count} Trait ({trait_label})")
+            elif not exempt and wallets and user_nft_count is not None:
+                holdings_parts.append(f"Trait ({trait_label}): N/A")
         total_str = " | ".join(holdings_parts) if holdings_parts else ""
 
         # Determine status based on registration mode
@@ -2150,12 +2225,19 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
             if user_nft_count is None:
                 status = "No Data"
             elif user_nft_count >= nft_threshold:
-                status = "Above Threshold"
+                # Check trait validity if trait gating is configured
+                if has_trait and user_trait_count is not None and user_trait_count < nft_trait_threshold:
+                    status = "Below Threshold"
+                else:
+                    status = "Above Threshold"
             else:
                 status = "Below Threshold"
         elif registration_mode == "both":
             token_ok = (balance_complete and total_balance >= threshold) if has_token else False
             nft_ok = (user_nft_count is not None and user_nft_count >= nft_threshold) if has_nft else False
+            # Apply trait check to NFT validity
+            if nft_ok and has_trait and user_trait_count is not None and user_trait_count < nft_trait_threshold:
+                nft_ok = False
             if not balance_complete and user_nft_count is None:
                 status = "No Data"
             elif token_ok or nft_ok:
@@ -3905,179 +3987,61 @@ def build_wallet_connect_url(group_id, user_id, cfg=None):
 def register_wallets(message):
     is_private = (message.chat.type == 'private')
     user_id = message.from_user.id
-    group_id = None
 
     if is_private:
-        with get_db_cursor() as (conn, cur):
-            cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (user_id,))
-            result = cur.fetchone()
-        if not result:
-            return bot.reply_to(
-                message,
-                "⚠️ No group registration context found.\n\n"
-                "Please run /register in your target group first."
-            )
-        group_id = result[0]
-    else:
-        group_id = message.chat.id
-
-        with get_db_cursor() as (conn, cur):
-            cur.execute(
-                """
-                INSERT INTO pending_verifications (user_id, group_id, created_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    group_id = EXCLUDED.group_id,
-                    created_at = EXCLUDED.created_at,
-                    wallet_address = NULL
-                """,
-                (user_id, group_id)
-            )
-
-        with config_lock:
-            group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
-        # Always use a URL button so the /verify page opens in the user's
-        # external browser where wallet extensions are available.
-        connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
-        verify_url = f"{connect_url}&source=telegram_register"
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=verify_url))
-
-        message_thread_id = getattr(message, 'message_thread_id', None)
-        register_text = (
-            "🔐 **Wallet Registration**\n\n"
-            "Tap **Verify Wallet** to open the verification page and connect your SUI wallet.\n"
-            "Your wallet is verified on-chain automatically!"
-        )
-
-        if message_thread_id:
-            bot.send_message(
-                message.chat.id,
-                register_text,
-                reply_markup=markup,
-                parse_mode="Markdown",
-                message_thread_id=message_thread_id
-            )
-        else:
-            bot.send_message(
-                message.chat.id,
-                register_text,
-                reply_markup=markup,
-                parse_mode="Markdown"
-            )
-        return
-
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
         return bot.reply_to(
             message,
-            "📝 Usage: `/register [wallet_address]`\n"
-            "Please provide one wallet address for verification.",
+            "ℹ️ Wallet registration is done in your group chat or via an invite link.\n\n"
+            "Please use /register in the group where you want to verify your wallet.",
             parse_mode="Markdown"
         )
 
-    wallet_address = parts[1].strip()
-    if not is_valid_wallet_address(wallet_address):
-        return bot.reply_to(
-            message,
-            f"❌ Invalid wallet address format: `{wallet_address}`\n"
-            "Please ensure the address starts with '0x' and is properly formatted.",
-            parse_mode="Markdown"
-        )
+    group_id = message.chat.id
 
-    if wallet_already_registered(wallet_address, group_id, user_id=user_id):
-        return bot.reply_to(message, "⚠️ This wallet address is already registered to another user in this group.")
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            INSERT INTO pending_verifications (user_id, group_id, created_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                group_id = EXCLUDED.group_id,
+                created_at = EXCLUDED.created_at,
+                wallet_address = NULL
+            """,
+            (user_id, group_id)
+        )
 
     with config_lock:
-        cfg = SUBSCRIBER_CONFIGS.get(group_id)
-    if not cfg:
-        return bot.reply_to(
-            message,
-            "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.",
+        group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
+    # Always use a URL button so the /verify page opens in the user's
+    # external browser where wallet extensions are available.
+    connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
+    verify_url = f"{connect_url}&source=telegram_register"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=verify_url))
+
+    message_thread_id = getattr(message, 'message_thread_id', None)
+    register_text = (
+        "🔐 **Wallet Registration**\n\n"
+        "Tap **Verify Wallet** to open the verification page and connect your SUI wallet.\n"
+        "Your wallet is verified on-chain automatically!"
+    )
+
+    if message_thread_id:
+        bot.send_message(
+            message.chat.id,
+            register_text,
+            reply_markup=markup,
+            parse_mode="Markdown",
+            message_thread_id=message_thread_id
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            register_text,
+            reply_markup=markup,
             parse_mode="Markdown"
         )
-
-    registration_mode = cfg.get("registration_mode", "token")
-    processing_msg = bot.reply_to(message, "⏳ Verifying wallet balances and NFT ownership...")
-
-    try:
-        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
-
-        if not requirement_eval["requirements_met"]:
-            error_msg = "❌ *Wallet doesn't meet requirements:*\n\n" + "\n".join(
-                requirement_eval["errors"] or ["Please retry after updating your holdings."]
-            )
-            if requirement_eval["details"]:
-                error_msg += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
-            if registration_mode == "both":
-                error_msg += "\n\n_You need to meet either the token OR NFT requirement._"
-
-            bot.edit_message_text(
-                error_msg,
-                chat_id=message.chat.id,
-                message_id=processing_msg.message_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        with get_db_cursor() as (conn, cur):
-            cur.execute(
-                """
-                INSERT INTO pending_verifications (user_id, group_id, wallet_address, created_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    group_id = EXCLUDED.group_id,
-                    wallet_address = EXCLUDED.wallet_address,
-                    created_at = EXCLUDED.created_at
-                """,
-                (user_id, group_id, wallet_address)
-            )
-
-        try:
-            chat_obj = bot.get_chat(group_id)
-            group_name = chat_obj.title
-        except Exception:
-            group_name = f"Group {group_id}"
-
-        verification_message = (
-            "🎉 *Wallet Requirements Met!*\n\n"
-            f"📱 Wallet: `{wallet_address}`\n"
-            f"🏆 Group: {group_name}\n\n"
-            "**Verification Details:**\n"
-        )
-        if requirement_eval["details"]:
-            verification_message += "\n".join(requirement_eval["details"]) + "\n\n"
-
-        verification_message += (
-            "**🔐 Final Step - On-Chain Verification:**\n\n"
-            "Click the button below to re-check your on-chain holdings and finalize registration.\n\n"
-            "No transfer is required.\n\n"
-            f"⏰ _Verification expires in {VERIFICATION_TIMEOUT // 60} minutes._"
-        )
-
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Confirm Wallet", callback_data=f"verify_wallet_{user_id}"))
-
-        bot.edit_message_text(
-            verification_message,
-            chat_id=message.chat.id,
-            message_id=processing_msg.message_id,
-            parse_mode="Markdown",
-            reply_markup=markup
-        )
-
-        logging.info(f"Started wallet verification for user {user_id}, wallet {wallet_address}")
-
-    except Exception as e:
-        logging.error(f"Error during wallet verification: {e}")
-        try:
-            bot.edit_message_text(
-                "❌ Error verifying wallet. Please try again later.",
-                chat_id=message.chat.id,
-                message_id=processing_msg.message_id
-            )
-        except Exception:
-            pass
 
 
 @db_retry
