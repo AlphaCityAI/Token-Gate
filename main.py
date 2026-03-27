@@ -121,6 +121,26 @@ def _validate_verify_token(token, group_id, user_id, max_age=None):
         return False
 
 
+def _apply_verify_token_fallback(requirement_eval, balance_verified, verify_token, group_id, user_id, context_label):
+    """Accept the client-side verification when the backend RPC fails and the
+    request carries a valid page-session token.
+
+    Returns the (possibly updated) *requirement_eval* dict.
+    """
+    if (
+        requirement_eval.get('rpc_failed')
+        and not requirement_eval['requirements_met']
+        and balance_verified
+        and _validate_verify_token(verify_token, group_id, user_id)
+    ):
+        logging.warning(
+            f"{context_label}: server-side RPC failed for user {user_id}, "
+            f"group {group_id} — accepting client-side verification (valid page token)"
+        )
+        return {"requirements_met": True, "details": requirement_eval.get('details', []), "errors": []}
+    return requirement_eval
+
+
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
 
@@ -4149,13 +4169,10 @@ def handle_wallet_webapp_data(message):
     # Fallback: when the server-side RPC check fails but the client already
     # verified successfully via a genuine /verify page load, accept the
     # result instead of showing a confusing error.
-    if requirement_eval.get('rpc_failed') and not requirement_eval['requirements_met']:
-        if balance_verified and _validate_verify_token(verify_token_val, group_id, user_id):
-            logging.warning(
-                f"handle_wallet_webapp_data: server-side RPC failed for user {user_id}, wallet {wallet_address}, "
-                f"group {group_id} — accepting client-side verification (valid page token)"
-            )
-            requirement_eval = {"requirements_met": True, "details": requirement_eval.get('details', []), "errors": []}
+    requirement_eval = _apply_verify_token_fallback(
+        requirement_eval, balance_verified, verify_token_val, group_id, user_id,
+        "handle_wallet_webapp_data"
+    )
 
     # Always save / update the wallet so the user's database record reflects
     # the current registration mode and wallet list, even when requirements
@@ -5414,6 +5431,7 @@ def wallet_connect_webapp():
                 dfCursor = dfPage.hasNextPage ? dfPage.nextCursor : null;
               }} while (dfCursor && count < MAX_NFT_ENUMERATE);
             }} catch (_kioskErr) {{
+              console.warn('Kiosk enumeration error for', kioskIds[ki], _kioskErr);
               // Continue with remaining kiosks if one fails
             }}
           }}
@@ -5681,15 +5699,10 @@ def api_verify():
             # request carries a valid page-session token AND the client
             # reported that its own on-chain check passed, accept the result
             # rather than showing a confusing "Unable to verify" error.
-            if requirement_eval.get('rpc_failed') and not requirement_eval['requirements_met']:
-                client_verified = data.get('balance_verified')
-                verify_tok = data.get('verify_token', '')
-                if client_verified and _validate_verify_token(verify_tok, group_id, tg_user_id):
-                    logging.warning(
-                        f"api_verify: server-side RPC failed for user {tg_user_id}, wallet {wallet_address}, "
-                        f"group {group_id} — accepting client-side verification (valid page token)"
-                    )
-                    requirement_eval = {"requirements_met": True, "details": requirement_eval.get('details', []), "errors": []}
+            requirement_eval = _apply_verify_token_fallback(
+                requirement_eval, data.get('balance_verified'), data.get('verify_token', ''),
+                group_id, tg_user_id, "api_verify"
+            )
 
         # Resolve display name (best-effort)
         username = _get_user_display_name(tg_user_id)
