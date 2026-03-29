@@ -1169,10 +1169,10 @@ def admin_required(func):
     @functools.wraps(func)
     def wrapper(message):
         if message.chat.type not in ["group", "supergroup"]:
-            bot.reply_to(message, "This command is only available in groups.")
+            bot.reply_to(message, "❌ This command is only available in groups.")
             return
         if not is_group_admin(message):
-            bot.reply_to(message, "Only group admins can use this command.")
+            bot.reply_to(message, "❌ Only group admins can use this command.")
             return
         return func(message)
     return wrapper
@@ -1211,7 +1211,7 @@ def reminder_command(message):
 
         # Create inline keyboard with registration button
         markup = types.InlineKeyboardMarkup()
-        register_btn = types.InlineKeyboardButton("Verify wallet for this group", url=reg_link)
+        register_btn = types.InlineKeyboardButton("✅ Verify Wallet", url=reg_link)
         markup.add(register_btn)
 
         reminder_text = (
@@ -1383,7 +1383,7 @@ def handle_private_config_callback(call):
         if call.data.startswith("privconfig_") or call.data.startswith("privvote_"):
             parts = call.data.split("_")
             if len(parts) < 3:
-                bot.answer_callback_query(call.id, "Invalid config action.")
+                bot.answer_callback_query(call.id, "❌ Invalid config action.")
                 return
             group_id = int(parts[1])
             action = parts[2]
@@ -1396,7 +1396,7 @@ def handle_private_config_callback(call):
                 cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (call.from_user.id,))
                 result = cur.fetchone()
                 if not result:
-                    bot.answer_callback_query(call.id, "Group context lost. Please restart.")
+                    bot.answer_callback_query(call.id, "❌ Group context lost. Please restart.")
                     return
                 group_id = result[0]
              action = parts[1] if len(parts) > 1 else ""
@@ -1404,7 +1404,7 @@ def handle_private_config_callback(call):
         else: # For mywallet_
             parts = call.data.split("_")
             if len(parts) < 3:
-                bot.answer_callback_query(call.id, "Invalid wallet action.")
+                bot.answer_callback_query(call.id, "❌ Invalid wallet action.")
                 return
             group_id = int(parts[1])
             action = parts[2]
@@ -1416,14 +1416,14 @@ def handle_private_config_callback(call):
             try:
                 member = bot.get_chat_member(group_id, user_id)
                 if member.status not in ["creator", "administrator"]:
-                    bot.answer_callback_query(call.id, "Unauthorized action.")
-                    bot.edit_message_text("Permission denied.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+                    bot.answer_callback_query(call.id, "❌ Unauthorized action.")
+                    bot.edit_message_text("❌ Permission denied.", chat_id=call.message.chat.id, message_id=call.message.message_id)
                     return
             except Exception:
-                bot.answer_callback_query(call.id, "Could not verify admin status.")
+                bot.answer_callback_query(call.id, "❌ Could not verify admin status.")
                 return
 
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "⏳ Processing…")
 
         # --- THE REST OF THE FUNCTION LOGIC REMAINS THE SAME ---
         # (This combines the logic from the deleted function with the new one)
@@ -1520,7 +1520,7 @@ def handle_private_config_callback(call):
             markup.add(types.InlineKeyboardButton("Set Trait Value", callback_data=f"privconfig_{group_id}_settraitvalue"))
             markup.add(types.InlineKeyboardButton("Set Trait Threshold", callback_data=f"privconfig_{group_id}_settraitthreshold"))
             markup.add(types.InlineKeyboardButton("Clear Trait Gate", callback_data=f"privconfig_{group_id}_cleartraitgate"))
-            markup.add(types.InlineKeyboardButton("« Back", callback_data=f"privconfig_{group_id}_back"))
+            markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data=f"privconfig_{group_id}_back"))
             
             bot.edit_message_text(current_settings, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
         elif action == "settraitname":
@@ -1561,7 +1561,7 @@ def handle_private_config_callback(call):
 
     except Exception as e:
         logging.error(f"Error in handle_private_config_callback: {e}")
-        bot.answer_callback_query(call.id, "An error occurred.")
+        bot.answer_callback_query(call.id, "❌ An error occurred.")
         
 
 def handle_mywallets_callback(call):
@@ -1569,7 +1569,7 @@ def handle_mywallets_callback(call):
     try:
         parts = call.data.split("_")
         if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Invalid wallet action.")
+            bot.answer_callback_query(call.id, "❌ Invalid wallet action.")
             return
 
         group_id = int(parts[1])
@@ -1588,7 +1588,7 @@ def handle_mywallets_callback(call):
             user_reg = get_user_registration(group_id, user_id)
             wallets = user_reg.get("wallets", []) if user_reg else []
             if not wallets:
-                bot.send_message(call.message.chat.id, "You have no wallets to remove.")
+                bot.send_message(call.message.chat.id, "ℹ️ You have no wallets to remove.")
                 return
 
             markup = types.InlineKeyboardMarkup()
@@ -1597,7 +1597,7 @@ def handle_mywallets_callback(call):
                 callback_data = f"mywallet_{group_id}_dodelete_{wallet}"
                 markup.add(types.InlineKeyboardButton(f"🗑️ {display_wallet}", callback_data=callback_data))
 
-            markup.add(types.InlineKeyboardButton("« Back", callback_data=f"mywallet_{group_id}_back"))
+            markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data=f"mywallet_{group_id}_back"))
             bot.edit_message_text("Select a wallet to remove:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
 
         elif action == "dodelete" and len(parts) == 4:
@@ -1612,7 +1612,7 @@ def handle_mywallets_callback(call):
                 cfg = SUBSCRIBER_CONFIGS.get(group_id)
                 reg_type = cfg.get("registration_mode", "token") if cfg else "token"
             save_wallet_for_user(group_id, user_id, call.from_user.username or call.from_user.first_name, updated_wallets, replace_existing=True, registration_type=reg_type)
-            bot.send_message(call.message.chat.id, f"Wallet removed successfully.")
+            bot.send_message(call.message.chat.id, "✅ Wallet removed successfully.")
             bot.delete_message(call.message.chat.id, call.message.message_id)
             show_mywallets_private(call.message.chat.id, group_id)
 
@@ -1622,7 +1622,7 @@ def handle_mywallets_callback(call):
 
     except Exception as e:
         logging.error(f"Error in handle_mywallets_callback: {e}")
-        bot.answer_callback_query(call.id, "An error occurred.")
+        bot.answer_callback_query(call.id, "❌ An error occurred.")
 
 def process_add_wallet_private(message, group_id, replace_existing):
     """Handles adding or replacing a wallet from the private menu."""
@@ -1663,7 +1663,7 @@ def process_add_wallet_private(message, group_id, replace_existing):
 
     except Exception as e:
         logging.error(f"Error in process_add_wallet_private: {e}")
-        bot.reply_to(message, "An error occurred while processing your request.")
+        bot.reply_to(message, "❌ An error occurred while processing your request. Please try again.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("verify_wallet_"))
 def handle_verify_wallet_callback(call):
@@ -1673,12 +1673,12 @@ def handle_verify_wallet_callback(call):
         
         parts = call.data.split("_")
         if len(parts) != 3:
-            bot.answer_callback_query(call.id, "Invalid verification request")
+            bot.answer_callback_query(call.id, "❌ Invalid verification request.")
             return
         
         expected_user_id = int(parts[2])
         if user_id != expected_user_id:
-            bot.answer_callback_query(call.id, "This verification is not for you")
+            bot.answer_callback_query(call.id, "❌ This verification is not for you.")
             return
 
         with get_db_cursor() as (conn, cur):
@@ -1686,7 +1686,7 @@ def handle_verify_wallet_callback(call):
             verification_data = cur.fetchone()
 
         if not verification_data:
-            bot.answer_callback_query(call.id, "No pending verification found")
+            bot.answer_callback_query(call.id, "❌ No pending verification found.")
             bot.edit_message_text(
                 "❌ No pending wallet verification found.\n\n"
                 "Please use /register to start the verification process.",
@@ -1698,7 +1698,7 @@ def handle_verify_wallet_callback(call):
         group_id, wallet_address, timestamp = verification_data
 
         if not wallet_address or not isinstance(wallet_address, str):
-            bot.answer_callback_query(call.id, "Invalid wallet data")
+            bot.answer_callback_query(call.id, "❌ Invalid wallet data.")
             with get_db_cursor() as (conn, cur):
                 cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
             bot.edit_message_text(
@@ -1712,7 +1712,7 @@ def handle_verify_wallet_callback(call):
         if not timestamp or time.time() - timestamp.timestamp() > VERIFICATION_TIMEOUT:
             with get_db_cursor() as (conn, cur):
                 cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
-            bot.answer_callback_query(call.id, "Verification timed out")
+            bot.answer_callback_query(call.id, "⏰ Verification timed out.")
             bot.edit_message_text(
                 "❌ Verification timed out.\n\n"
                 "Please use /register to start the verification process again.",
@@ -1836,7 +1836,7 @@ def handle_verify_wallet_callback(call):
 
     except Exception as e:
         logging.error(f"Error in handle_verify_wallet_callback: {e}")
-        bot.answer_callback_query(call.id, "An error occurred.")
+        bot.answer_callback_query(call.id, "❌ An error occurred.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("poll_vote_"))
 def handle_poll_callback(call):
@@ -1850,11 +1850,11 @@ def handle_poll_callback(call):
                 handle_poll_vote(call, poll_id, option_index)
                 return
             else:
-                bot.answer_callback_query(call.id, "Invalid poll action")
+                bot.answer_callback_query(call.id, "❌ Invalid poll action.")
                 return
     except Exception as e:
         logging.error(f"Error in poll callback handler: {e}")
-        bot.answer_callback_query(call.id, "An error occurred.")
+        bot.answer_callback_query(call.id, "❌ An error occurred.")
 
 
 
@@ -1895,7 +1895,7 @@ def create_registration_link(group_id, send_to_chat_id=None):
     except Exception as e:
         logging.error(f"Error in create_registration_link for group {group_id} to chat {target_chat_id}: {e}")
         try:
-            bot.send_message(target_chat_id, f"❌ Error creating registration link: {str(e)}")
+            bot.send_message(target_chat_id, "❌ Error creating registration link. Please try again.")
         except Exception as fallback_e:
             logging.error(f"Failed to send error message: {fallback_e}")
         return False
@@ -1939,7 +1939,7 @@ def show_config_menu_private(chat_id, group_id):
         btn9 = types.InlineKeyboardButton("View Wallets", callback_data=f"privconfig_{group_id}_viewwallets")
         btn10 = types.InlineKeyboardButton("Manage Exemptions", callback_data=f"privconfig_{group_id}_exemptions")
         btn11 = types.InlineKeyboardButton("Create Registration Link", callback_data=f"privconfig_{group_id}_createreglink")
-        btn12 = types.InlineKeyboardButton("🎨 Set NFT Trait Gate", callback_data=f"privconfig_{group_id}_settraitgate")
+        btn12 = types.InlineKeyboardButton("Set NFT Trait Gate", callback_data=f"privconfig_{group_id}_settraitgate")
 
         markup.add(btn1)
         markup.add(btn2)
@@ -2507,7 +2507,7 @@ def display_settings(group_id, send_to_chat_id=None):
 def process_set_token_config(message, group_id):
     parts = message.text.strip().split()
     if len(parts) != 3:
-        bot.send_message(message.chat.id, "Invalid format. Please provide the token address, minimum holding, and decimals separated by spaces.")
+        bot.send_message(message.chat.id, "❌ Invalid format. Please provide the token address, minimum holding, and decimals separated by spaces.")
         return
 
     token, threshold_str, decimals_str = parts
@@ -2515,7 +2515,7 @@ def process_set_token_config(message, group_id):
         threshold = float(threshold_str)
         decimals = int(decimals_str)
     except ValueError:
-        bot.send_message(message.chat.id, "Invalid threshold or decimals value. Please ensure they are numbers.")
+        bot.send_message(message.chat.id, "❌ Invalid threshold or decimals value. Please ensure they are numbers.")
         return
 
     with config_lock:
@@ -2526,7 +2526,7 @@ def process_set_token_config(message, group_id):
         SUBSCRIBER_CONFIGS[group_id]['minimum_holding'] = threshold
         SUBSCRIBER_CONFIGS[group_id]['decimals'] = decimals
         update_config_in_db(group_id, SUBSCRIBER_CONFIGS[group_id])
-        bot.send_message(message.chat.id, f"Token configuration updated:\n- Address: {token}\n- Threshold: {threshold}\n- Decimals: {decimals}")
+        bot.send_message(message.chat.id, f"✅ Token configuration updated:\n- Address: {token}\n- Threshold: {threshold}\n- Decimals: {decimals}")
 
 def process_set_nft_collection(message, group_id):
     collection_id = message.text.strip()
@@ -2534,19 +2534,19 @@ def process_set_nft_collection(message, group_id):
         ensure_config_exists(group_id)
         SUBSCRIBER_CONFIGS[group_id]['nft_collection_id'] = collection_id
         update_config_in_db(group_id, SUBSCRIBER_CONFIGS[group_id])
-    bot.send_message(message.chat.id, f"NFT Collection ID updated to: {collection_id}")
+    bot.send_message(message.chat.id, f"✅ NFT Collection ID updated to: {collection_id}")
 
 def process_set_nft_threshold(message, group_id):
     try:
         threshold = int(message.text.strip())
     except ValueError:
-        bot.send_message(message.chat.id, "Invalid NFT threshold value. Please enter a number.")
+        bot.send_message(message.chat.id, "❌ Invalid NFT threshold value. Please enter a number.")
         return
     with config_lock:
         ensure_config_exists(group_id)
         SUBSCRIBER_CONFIGS[group_id]['nft_threshold'] = threshold
         update_config_in_db(group_id, SUBSCRIBER_CONFIGS[group_id])
-    bot.send_message(message.chat.id, f"NFT Threshold updated to: {threshold}")
+    bot.send_message(message.chat.id, f"✅ NFT Threshold updated to: {threshold}")
 
 def process_set_trait_name(message, group_id):
     """Set the NFT trait name for trait gating."""
@@ -2578,7 +2578,7 @@ def process_set_trait_threshold(message, group_id):
         if threshold < 1:
             raise ValueError("Threshold must be at least 1")
     except ValueError:
-        bot.send_message(message.chat.id, "Invalid value. Please enter a positive integer.")
+        bot.send_message(message.chat.id, "❌ Invalid value. Please enter a positive integer.")
         return
     with config_lock:
         ensure_config_exists(group_id)
@@ -2592,7 +2592,7 @@ def process_set_votes_per_nft(message, group_id):
         if votes < 0:
             raise ValueError("Votes must be non-negative")
     except ValueError:
-        bot.send_message(message.chat.id, "Invalid value. Please enter a non-negative integer.")
+        bot.send_message(message.chat.id, "❌ Invalid value. Please enter a non-negative integer.")
         return
     with config_lock:
         ensure_config_exists(group_id)
@@ -2606,7 +2606,7 @@ def process_set_votes_per_million(message, group_id):
         if votes < 0:
             raise ValueError("Votes must be non-negative")
     except ValueError:
-        bot.send_message(message.chat.id, "Invalid value. Please enter a non-negative integer.")
+        bot.send_message(message.chat.id, "❌ Invalid value. Please enter a non-negative integer.")
         return
     with config_lock:
         ensure_config_exists(group_id)
@@ -2622,7 +2622,7 @@ def process_set_vote_duration(message, group_id):
         # Convert hours to seconds
         duration = int(hours * 3600)
     except ValueError:
-        bot.send_message(message.chat.id, "Invalid value. Please enter a positive number (hours).")
+        bot.send_message(message.chat.id, "❌ Invalid value. Please enter a positive number (hours).")
         return
     with config_lock:
         ensure_config_exists(group_id)
@@ -2636,7 +2636,7 @@ def process_set_votes_per_exempt(message, group_id):
         if votes < 0:
             raise ValueError("Votes must be non-negative")
     except ValueError:
-        bot.send_message(message.chat.id, "Invalid value. Please enter a non-negative integer.")
+        bot.send_message(message.chat.id, "❌ Invalid value. Please enter a non-negative integer.")
         return
     with config_lock:
         ensure_config_exists(group_id)
@@ -3479,7 +3479,7 @@ def display_exemption_manager(group_id, send_to_chat_id):
             markup.add(types.InlineKeyboardButton(btn_text, callback_data=callback_data))
 
         # Add a back button to return to the main config menu
-        markup.add(types.InlineKeyboardButton("« Back to Config", callback_data=f"privconfig_{group_id}_back"))
+        markup.add(types.InlineKeyboardButton("⬅️ Back to Config", callback_data=f"privconfig_{group_id}_back"))
 
         message = "\n".join(message_lines)
         bot.send_message(send_to_chat_id, message, reply_markup=markup, parse_mode="Markdown")
@@ -3493,12 +3493,12 @@ def display_exemption_manager(group_id, send_to_chat_id):
 def add_wallet_command(message):
     try:
         if not message.reply_to_message:
-            bot.reply_to(message, "Please use this command by replying to a user's message.")
+            bot.reply_to(message, "❌ Please use this command by replying to a user's message.")
             return
 
         command_parts = message.text.split()
         if len(command_parts) < 2:
-            bot.reply_to(message, "Usage: Reply to a user's message with `/addwallet <wallet_address>`")
+            bot.reply_to(message, "❌ Usage: Reply to a user's message with `/addwallet <wallet_address>`")
             return
 
         wallet_address = command_parts[1].strip()
@@ -3552,7 +3552,7 @@ def add_wallet_command(message):
             )
     except Exception as e:
         logging.error(f"Error in add_wallet_command: {e}")
-        bot.reply_to(message, "An error occurred while processing this command.")
+        bot.reply_to(message, "❌ An error occurred while processing this command.")
 
 @bot.message_handler(commands=['mywallets'])
 def mywallets_command(message):
@@ -3699,7 +3699,7 @@ def mywallets_command(message):
 def exempt_command(message):
     try:
         if not message.reply_to_message:
-            bot.reply_to(message, "Please use this command by replying to a user's message to exempt them.")
+            bot.reply_to(message, "❌ Please use this command by replying to a user's message to exempt them.")
             return
 
         chat_id = message.chat.id
@@ -3736,7 +3736,7 @@ def exempt_command(message):
 
     except Exception as e:
         logging.error(f"Error in exempt command: {e}")
-        bot.reply_to(message, "An error occurred while processing the exemption.")
+        bot.reply_to(message, "❌ An error occurred while processing the exemption.")
 
 @bot.chat_member_handler()
 def handle_chat_member_update(update):
@@ -3901,7 +3901,7 @@ def handle_start(message):
                     parse_mode="Markdown"
                 )
             except ValueError:
-                bot.reply_to(message, "Invalid registration parameter.")
+                bot.reply_to(message, "❌ Invalid registration parameter.")
 
         elif param.startswith("config_"):
             group_id_str = param[len("config_"):]
@@ -3922,7 +3922,7 @@ def handle_start(message):
                 show_config_menu_private(message.chat.id, group_id)
 
             except ValueError:
-                bot.reply_to(message, "Invalid configuration parameter.")
+                bot.reply_to(message, "❌ Invalid configuration parameter.")
 
         elif param.startswith("votesetup_"):
             group_id_str = param[len("votesetup_"):]
@@ -3943,7 +3943,7 @@ def handle_start(message):
                 show_votesetup_menu_private(message.chat.id, group_id)
 
             except ValueError:
-                bot.reply_to(message, "Invalid voting setup parameter.")
+                bot.reply_to(message, "❌ Invalid voting setup parameter.")
 
         elif param.startswith("mywallets_"):
             group_id_str = param[len("mywallets_"):]
@@ -3965,11 +3965,11 @@ def handle_start(message):
                 show_mywallets_private(message.chat.id, group_id)
 
             except ValueError:
-                bot.reply_to(message, "Invalid mywallets parameter.")
+                bot.reply_to(message, "❌ Invalid mywallets parameter.")
         else:
-            bot.reply_to(message, "Welcome!")
+            bot.reply_to(message, "👋 Welcome to GuildSafe!")
     else:
-        bot.reply_to(message, "Welcome!")
+        bot.reply_to(message, "👋 Welcome to GuildSafe! Use /help to see available commands.")
 
 # New command handler for /confirm
 @db_retry
@@ -4510,14 +4510,14 @@ def wallet_connect_webapp():
       --border: #334155; --text: #e2e8f0; --muted: #94a3b8;
       --green: #22c55e; --green-bg: #14532d; --green-text: #86efac;
       --red: #ef4444; --red-bg: #450a0a; --red-text: #fca5a5;
-      --blue: #3b82f6; --blue-bg: #1e3a5f;
+      --blue: #3b82f6; --blue-bg: #1e3a5f; --blue-text: #93c5fd;
       --radius: 12px;
     }}
     *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       background: var(--bg); color: var(--text);
-      min-height: 100vh; padding: 0;
+      min-height: 100vh; padding: 0; line-height: 1.5;
     }}
     .app {{ max-width: 480px; margin: 0 auto; padding: 16px 16px 32px; }}
 
@@ -4558,7 +4558,7 @@ def wallet_connect_webapp():
       padding: 20px; margin-bottom: 14px;
       border: 1px solid var(--border);
     }}
-    .card h2 {{ font-size: 16px; margin-bottom: 12px; }}
+    .card h2 {{ font-size: 16px; font-weight: 600; margin-bottom: 12px; }}
 
     /* ── Requirements panel ── */
     .req-item {{
@@ -4576,11 +4576,12 @@ def wallet_connect_webapp():
     }}
     .wallet-item {{
       display: flex; align-items: center; gap: 12px;
-      padding: 14px; background: var(--card2); border-radius: 10px;
+      padding: 14px; min-height: 44px; background: var(--card2); border-radius: 10px;
       border: 1px solid var(--border); cursor: pointer;
       transition: all .2s;
     }}
     .wallet-item:hover {{ border-color: var(--blue); background: var(--bg); }}
+    .wallet-item:active {{ transform: scale(0.98); }}
     .wallet-item .w-icon {{
       width: 36px; height: 36px; border-radius: 8px; background: var(--card);
       display: flex; align-items: center; justify-content: center;
@@ -4605,17 +4606,17 @@ def wallet_connect_webapp():
       color: var(--green-text); word-break: break-all;
     }}
 
-
-
     /* ── Primary button ── */
     .btn {{
-      width: 100%; padding: 14px; border: 0; border-radius: 10px;
+      width: 100%; padding: 14px; min-height: 44px; border: 0; border-radius: 10px;
       font-weight: 700; font-size: 15px; cursor: pointer;
       transition: all .2s; margin-top: 14px;
       display: flex; align-items: center; justify-content: center; gap: 8px;
     }}
     .btn-primary {{ background: var(--green); color: #052e16; }}
     .btn-primary:hover {{ filter: brightness(1.1); }}
+    .btn:active:not(:disabled) {{ transform: scale(0.98); }}
+    .btn:focus-visible {{ outline: 2px solid var(--blue); outline-offset: 2px; }}
     .btn:disabled {{ opacity: 0.5; cursor: not-allowed; filter: none; }}
 
     /* ── Status / result ── */
@@ -4663,7 +4664,7 @@ def wallet_connect_webapp():
     .alert.show {{ display: block; }}
     .alert-error {{ background: var(--red-bg); color: var(--red-text); }}
     .alert-success {{ background: var(--green-bg); color: var(--green-text); }}
-    .alert-info {{ background: var(--blue-bg); color: #93c5fd; }}
+    .alert-info {{ background: var(--blue-bg); color: var(--blue-text); }}
 
     /* ── External-browser prompt ── */
     .browser-prompt {{
@@ -4673,12 +4674,15 @@ def wallet_connect_webapp():
     }}
     .browser-prompt .bp-icon {{ font-size: 32px; margin-bottom: 8px; }}
     .browser-prompt p {{
-      color: #93c5fd; font-size: 13px; line-height: 1.5; margin-bottom: 14px;
+      color: var(--blue-text); font-size: 13px; line-height: 1.5; margin-bottom: 14px;
     }}
     .btn-browser {{
       background: var(--blue); color: #fff;
     }}
     .btn-browser:hover {{ filter: brightness(1.1); }}
+
+    /* ── Change wallet link ── */
+    #changeWalletBtn:hover {{ text-decoration: underline; }}
 
     /* ── Sections ── */
     .section {{ display: none; }}
@@ -4691,6 +4695,11 @@ def wallet_connect_webapp():
     /* ── Scanning animation ── */
     .scanning {{ text-align: center; padding: 16px 0 8px; }}
     .scanning .spinner {{ width: 24px; height: 24px; }}
+
+    /* ── Responsive ── */
+    @media (min-width: 520px) {{
+      .app {{ padding: 24px 24px 40px; }}
+    }}
   </style>
 </head>
 <body>
@@ -4698,7 +4707,7 @@ def wallet_connect_webapp():
   <!-- Header -->
   <div class="header">
     <div class="logo">🔐</div>
-    <h1>Wallet Verification</h1>
+    <h1>GuildSafe Verification</h1>
     <div class="subtitle">Connect your SUI wallet to verify holdings</div>
   </div>
 
@@ -4814,7 +4823,8 @@ def wallet_connect_webapp():
     if (tp.text_color) document.documentElement.style.setProperty('--text', tp.text_color);
     if (tp.hint_color) document.documentElement.style.setProperty('--muted', tp.hint_color);
     if (tp.button_color) document.documentElement.style.setProperty('--blue', tp.button_color);
-    if (tp.button_color) document.documentElement.style.setProperty('--green', tp.button_color);
+    // Note: --green is intentionally NOT overridden by button_color to preserve
+    // semantic distinction between success (green) and primary action (blue) states.
   }}
 
   /* ── Configuration from query params (server-injected) ── */
@@ -5071,7 +5081,7 @@ def wallet_connect_webapp():
           : null;
 
       if (!connectFn) {{
-        throw new Error('Wallet does not support connect');
+        throw new Error('This wallet is not supported. Please try a different wallet.');
       }}
 
       const result = await connectFn();
@@ -5106,7 +5116,7 @@ def wallet_connect_webapp():
       }}
 
       if (!address || !isValidSuiAddress(address)) {{
-        throw new Error('No valid SUI address returned from wallet');
+        throw new Error('Could not retrieve a valid wallet address. Please try again.');
       }}
 
       return {{ address: address, account: connectedAccount, wallet: wallet }};
@@ -5574,7 +5584,7 @@ def wallet_connect_webapp():
       $fill.style.width = '80%';
     }}
 
-    $status.textContent = 'Finalising…';
+    $status.textContent = 'Submitting results…';
     $fill.style.width = '100%';
 
     return result;
