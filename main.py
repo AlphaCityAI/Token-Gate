@@ -2258,6 +2258,11 @@ def show_config_menu_private(chat_id, group_id):
 def show_votesetup_menu_private(chat_id, group_id):
     """Show voting setup menu in private chat for a specific group"""
     try:
+        # Check subscription before showing voting config
+        if not has_active_subscription(group_id):
+            show_subscription_prompt(chat_id, group_id)
+            return
+
         # Get group name
         try:
             chat_obj = bot.get_chat(group_id)
