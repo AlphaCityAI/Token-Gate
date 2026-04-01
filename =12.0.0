@@ -1,9 +1,0 @@
-Defaulting to user installation because normal site-packages is not writeable
-Collecting stripe
-  Downloading stripe-15.0.0-py3-none-any.whl.metadata (18 kB)
-Requirement already satisfied: typing_extensions>=4.7.0 in /usr/lib/python3/dist-packages (from stripe) (4.10.0)
-Requirement already satisfied: requests>=2.20 in /usr/lib/python3/dist-packages (from stripe) (2.31.0)
-Downloading stripe-15.0.0-py3-none-any.whl (2.1 MB)
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 119.9 MB/s eta 0:00:00
-Installing collected packages: stripe
-Successfully installed stripe-15.0.0

@@ -80,7 +80,10 @@ if STRIPE_SECRET_KEY:
 BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '0'))
 
 # Groups that can use the bot WITHOUT an active subscription.
-# Edit this list directly to add/remove whitelisted group IDs.
+# Edit this set directly in code to add/remove whitelisted group IDs.
+# This is intentionally kept at the code level for security, as the bot
+# owner requested. Alternatively, populate from an environment variable:
+#   WHITELISTED_GROUPS = set(int(g) for g in os.getenv('WHITELISTED_GROUPS', '').split(',') if g.strip())
 WHITELISTED_GROUPS: set[int] = {
     # Example: -1001234567890,
 }
@@ -841,7 +844,7 @@ def activate_subscription(group_id, stripe_session_id, tier, activated_by):
 def create_stripe_checkout_session(group_id, user_id, tier):
     """Create a Stripe Checkout Session for a subscription purchase."""
     if not STRIPE_SECRET_KEY:
-        raise RuntimeError("Stripe is not configured (STRIPE_SECRET_KEY missing)")
+        raise RuntimeError("Stripe is not configured. Ensure STRIPE_SECRET_KEY is set in environment variables.")
     tier_info = SUBSCRIPTION_TIERS.get(tier)
     if not tier_info:
         raise ValueError(f"Unknown tier: {tier}")
@@ -1571,13 +1574,18 @@ def handle_subscription_callback(call):
         try:
             session = create_stripe_checkout_session(group_id, user_id, tier)
             tier_info = SUBSCRIPTION_TIERS[tier]
+            try:
+                chat_obj = bot.get_chat(group_id)
+                group_name = chat_obj.title
+            except Exception:
+                group_name = f"Group {group_id}"
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("💳 Pay Now", url=session.url))
             markup.add(types.InlineKeyboardButton("« Back", callback_data=f"subscribe_{group_id}_back"))
             bot.edit_message_text(
                 f"💳 **Complete Your Payment**\n\n"
                 f"Plan: *{tier_info['label']}* — {tier_info['display']}\n"
-                f"Group: {group_id}\n\n"
+                f"Group: *{group_name}*\n\n"
                 f"Click the button below to complete your payment via Stripe.\n"
                 f"Once payment is confirmed, you'll be able to configure the bot.",
                 chat_id=call.message.chat.id,
@@ -6266,7 +6274,6 @@ def stripe_webhook():
 @app.route('/subscription/success')
 def subscription_success():
     """Simple success landing page after Stripe Checkout."""
-    session_id = request.args.get('session_id', '')
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
