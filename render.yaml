@@ -30,6 +30,20 @@ services:
       # Sui RPC endpoint (defaults to Mysten mainnet).
       - key: SUI_RPC_URL
         value: https://fullnode.mainnet.sui.io:443
+      # Stripe subscription payment keys (set in Render dashboard).
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_1M
+        sync: false
+      - key: STRIPE_PRICE_3M
+        sync: false
+      - key: STRIPE_PRICE_6M
+        sync: false
+      # Comma-separated list of Telegram group IDs that bypass subscription.
+      - key: WHITELISTED_GROUPS
+        value: ""
       # Database connection pool size (tune to your Render plan).
       - key: DB_POOL_MIN
         value: "2"

@@ -24,6 +24,7 @@ import functools
 import datetime
 import gc
 import psutil
+import stripe
 
 from src.nft_traits import get_user_nft_trait_count, get_user_nft_category_count, check_nft_trait_ownership
 
@@ -67,6 +68,36 @@ WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '').strip()
 # Allowed origin for CORS on /api/verify.  Defaults to '*' (any origin) which is safe
 # for this credential-free JSON API, but can be restricted to a specific domain.
 CORS_ALLOWED_ORIGIN = os.getenv('CORS_ALLOWED_ORIGIN', '*').strip() or '*'
+
+# ==================== Stripe Configuration ========================
+STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY', '').strip()
+STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET', '').strip()
+# Stripe Price IDs for each subscription tier (set in Stripe dashboard)
+STRIPE_PRICE_1M = os.getenv('STRIPE_PRICE_1M', '').strip()   # $3.99/month
+STRIPE_PRICE_3M = os.getenv('STRIPE_PRICE_3M', '').strip()   # $11.99/3 months
+STRIPE_PRICE_6M = os.getenv('STRIPE_PRICE_6M', '').strip()   # $21.99/6 months
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+# ==================== Group Whitelist =============================
+# Groups in this list can use the bot WITHOUT an active subscription.
+# Add Telegram group/chat IDs (integers) to bypass subscription checks.
+WHITELISTED_GROUPS = set()
+_wl_env = os.getenv('WHITELISTED_GROUPS', '').strip()
+if _wl_env:
+    for _gid in _wl_env.split(','):
+        _gid = _gid.strip()
+        if _gid.lstrip('-').isdigit():
+            WHITELISTED_GROUPS.add(int(_gid))
+    logging.info(f"Loaded {len(WHITELISTED_GROUPS)} whitelisted group(s) from env")
+
+# Subscription plan metadata
+SUBSCRIPTION_PLANS = {
+    "1m": {"label": "1 Month — $3.99", "price": 3.99, "months": 1},
+    "3m": {"label": "3 Months — $11.99", "price": 11.99, "months": 3},
+    "6m": {"label": "6 Months — $21.99", "price": 21.99, "months": 6},
+}
 
 BOT_NAME = "GuildSafeBot"
 CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
@@ -417,6 +448,19 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS group_subscriptions (
+                group_id BIGINT PRIMARY KEY,
+                stripe_customer_id TEXT,
+                stripe_subscription_id TEXT,
+                plan_type TEXT DEFAULT '',
+                status TEXT DEFAULT 'inactive',
+                current_period_end TIMESTAMP,
+                created_by BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         try:
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS auto_remove BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_collection_id TEXT DEFAULT ''")
@@ -569,6 +613,133 @@ def get_registration_mode_display(mode):
         "both": "NFT or Token"
     }
     return mode_display.get(mode, mode.title())
+
+# ==================== Subscription Helper Functions ===============
+
+def is_group_whitelisted(group_id):
+    """Check if a group is in the hardcoded whitelist (no subscription needed)."""
+    return int(group_id) in WHITELISTED_GROUPS
+
+
+@db_retry
+def get_group_subscription(group_id):
+    """Retrieve the subscription record for a group. Returns dict or None."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute("""
+            SELECT group_id, stripe_customer_id, stripe_subscription_id,
+                   plan_type, status, current_period_end, created_by,
+                   created_at, updated_at
+            FROM group_subscriptions WHERE group_id = %s
+        """, (int(group_id),))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "group_id": row[0],
+            "stripe_customer_id": row[1],
+            "stripe_subscription_id": row[2],
+            "plan_type": row[3],
+            "status": row[4],
+            "current_period_end": row[5],
+            "created_by": row[6],
+            "created_at": row[7],
+            "updated_at": row[8],
+        }
+
+
+def has_active_subscription(group_id):
+    """Return True if the group has an active (paid) subscription or is whitelisted."""
+    if is_group_whitelisted(group_id):
+        return True
+    sub = get_group_subscription(group_id)
+    if not sub:
+        return False
+    if sub["status"] not in ("active", "trialing"):
+        return False
+    # Check if the subscription period hasn't expired
+    if sub["current_period_end"]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        period_end = sub["current_period_end"]
+        if period_end.tzinfo is None:
+            period_end = period_end.replace(tzinfo=datetime.timezone.utc)
+        if now > period_end:
+            return False
+    return True
+
+
+@db_retry
+def upsert_group_subscription(group_id, **kwargs):
+    """Create or update a group subscription record."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute("""
+            INSERT INTO group_subscriptions
+                (group_id, stripe_customer_id, stripe_subscription_id,
+                 plan_type, status, current_period_end, created_by, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (group_id) DO UPDATE SET
+                stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, group_subscriptions.stripe_customer_id),
+                stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, group_subscriptions.stripe_subscription_id),
+                plan_type = COALESCE(EXCLUDED.plan_type, group_subscriptions.plan_type),
+                status = COALESCE(EXCLUDED.status, group_subscriptions.status),
+                current_period_end = COALESCE(EXCLUDED.current_period_end, group_subscriptions.current_period_end),
+                created_by = COALESCE(EXCLUDED.created_by, group_subscriptions.created_by),
+                updated_at = NOW()
+        """, (
+            int(group_id),
+            kwargs.get("stripe_customer_id"),
+            kwargs.get("stripe_subscription_id"),
+            kwargs.get("plan_type"),
+            kwargs.get("status"),
+            kwargs.get("current_period_end"),
+            kwargs.get("created_by"),
+        ))
+    logging.info(f"Upserted subscription for group {group_id}: status={kwargs.get('status')}")
+
+
+def create_stripe_checkout_session(group_id, user_id, plan_key):
+    """Create a Stripe Checkout Session for the given plan.
+    
+    Returns the checkout URL on success, or None on error.
+    """
+    if not STRIPE_SECRET_KEY:
+        logging.error("Stripe is not configured (STRIPE_SECRET_KEY missing)")
+        return None
+
+    price_map = {"1m": STRIPE_PRICE_1M, "3m": STRIPE_PRICE_3M, "6m": STRIPE_PRICE_6M}
+    price_id = price_map.get(plan_key)
+    if not price_id:
+        logging.error(f"No Stripe Price ID for plan '{plan_key}'")
+        return None
+
+    base_url = PUBLIC_WEBAPP_BASE_URL or ""
+    success_url = f"{base_url}/subscription/success?group_id={group_id}" if base_url else "https://t.me"
+    cancel_url = f"{base_url}/subscription/cancel?group_id={group_id}" if base_url else "https://t.me"
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "group_id": str(group_id),
+                "user_id": str(user_id),
+                "plan_key": plan_key,
+            },
+            subscription_data={
+                "metadata": {
+                    "group_id": str(group_id),
+                    "user_id": str(user_id),
+                    "plan_key": plan_key,
+                }
+            },
+        )
+        logging.info(f"Created Stripe checkout session {session.id} for group {group_id}, plan {plan_key}")
+        return session.url
+    except Exception as e:
+        logging.error(f"Error creating Stripe checkout session: {e}")
+        return None
 
 @db_retry
 def save_wallet_for_user(group_id, user_id, username, wallet_list, is_exempt=False, replace_existing=False, registration_type="token"):
@@ -1375,6 +1546,75 @@ def vote_command(message):
             parse_mode="Markdown"
         )
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sub_"))
+def handle_subscription_callback(call):
+    """Handles subscription plan selection and refresh callbacks."""
+    try:
+        parts = call.data.split("_")
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Invalid subscription action.")
+            return
+        group_id = int(parts[1])
+        action = parts[2]
+        user_id = call.from_user.id
+
+        # Verify admin status
+        try:
+            member = bot.get_chat_member(group_id, user_id)
+            if member.status not in ["creator", "administrator"]:
+                bot.answer_callback_query(call.id, "Only group admins can manage subscriptions.")
+                return
+        except Exception:
+            bot.answer_callback_query(call.id, "Could not verify admin status.")
+            return
+
+        bot.answer_callback_query(call.id)
+
+        if action == "refresh":
+            # Re-check subscription and show appropriate menu
+            if has_active_subscription(group_id):
+                bot.send_message(call.message.chat.id, "✅ Subscription is active! Loading configuration...")
+                show_config_menu_private(call.message.chat.id, group_id)
+            else:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+                show_subscription_prompt(call.message.chat.id, group_id)
+            return
+
+        if action in ("1m", "3m", "6m"):
+            plan = SUBSCRIPTION_PLANS.get(action)
+            if not plan:
+                bot.send_message(call.message.chat.id, "❌ Invalid plan selected.")
+                return
+
+            checkout_url = create_stripe_checkout_session(group_id, user_id, action)
+            if not checkout_url:
+                bot.send_message(
+                    call.message.chat.id,
+                    "❌ Could not create payment session. Please ensure Stripe is configured correctly and try again."
+                )
+                return
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(f"💳 Pay {plan['label']}", url=checkout_url))
+            markup.add(types.InlineKeyboardButton("🔄 I've Paid — Refresh", callback_data=f"sub_{group_id}_refresh"))
+            bot.send_message(
+                call.message.chat.id,
+                f"💳 **Complete Your Payment**\n\n"
+                f"Plan: **{plan['label']}**\n\n"
+                f"Click the button below to complete payment via Stripe.\n"
+                f"After payment, tap **\"I've Paid — Refresh\"** to activate your subscription.",
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+            return
+
+    except Exception as e:
+        logging.error(f"Error in subscription callback: {e}")
+        try:
+            bot.send_message(call.message.chat.id, "❌ An error occurred. Please try again.")
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("privconfig_") or call.data.startswith("config_") or call.data.startswith("privvote_"))
 def handle_private_config_callback(call):
     """Handles ALL callbacks from the private configuration menu."""
@@ -1900,9 +2140,63 @@ def create_registration_link(group_id, send_to_chat_id=None):
             logging.error(f"Failed to send error message: {fallback_e}")
         return False
 
+def show_subscription_prompt(chat_id, group_id):
+    """Show subscription options when a group doesn't have an active subscription."""
+    try:
+        try:
+            chat_obj = bot.get_chat(group_id)
+            group_name = chat_obj.title
+        except Exception:
+            group_name = f"Group {group_id}"
+
+        sub = get_group_subscription(group_id)
+        if sub and sub["status"] in ("past_due", "canceled", "inactive"):
+            status_msg = f"\n\n⚠️ Your subscription status: **{sub['status'].replace('_', ' ').title()}**"
+        else:
+            status_msg = ""
+
+        if not STRIPE_SECRET_KEY:
+            bot.send_message(
+                chat_id,
+                f"🔒 **Subscription Required**\n\n"
+                f"A paid subscription is required to configure **{group_name}**.\n\n"
+                f"Stripe payments are not yet configured. Please contact the bot administrator.{status_msg}",
+                parse_mode="Markdown"
+            )
+            return
+
+        text = (
+            f"🔒 **Subscription Required**\n\n"
+            f"An active subscription is needed to configure and use the bot in **{group_name}**.{status_msg}\n\n"
+            f"Choose a plan to get started:\n\n"
+            f"• **1 Month** — $3.99\n"
+            f"• **3 Months** — $11.99 _(save 0%→best monthly)_\n"
+            f"• **6 Months** — $21.99 _(best value)_\n\n"
+            f"Select a plan below:"
+        )
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("💳 1 Month — $3.99", callback_data=f"sub_{group_id}_1m"))
+        markup.add(types.InlineKeyboardButton("💳 3 Months — $11.99", callback_data=f"sub_{group_id}_3m"))
+        markup.add(types.InlineKeyboardButton("💳 6 Months — $21.99", callback_data=f"sub_{group_id}_6m"))
+        if sub:
+            markup.add(types.InlineKeyboardButton("🔄 Refresh Status", callback_data=f"sub_{group_id}_refresh"))
+
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+        logging.info(f"Showed subscription prompt for group {group_id} to user {chat_id}")
+    except Exception as e:
+        logging.error(f"Error showing subscription prompt: {e}")
+        bot.send_message(chat_id, "❌ Error loading subscription options. Please try again.")
+
+
 def show_config_menu_private(chat_id, group_id):
     """Show configuration menu in private chat for a specific group"""
     try:
+        # Check subscription before showing config
+        if not has_active_subscription(group_id):
+            show_subscription_prompt(chat_id, group_id)
+            return
+
         # Get group name
         try:
             chat_obj = bot.get_chat(group_id)
@@ -5907,6 +6201,205 @@ def api_verify():
         logging.error(f"Error in api_verify: {e}")
         resp = jsonify({'success': False, 'error': 'Internal server error'})
         return _add_cors_headers(resp), 500
+
+
+@app.route('/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    """Handle Stripe webhook events for subscription lifecycle."""
+    payload = request.get_data()
+    sig_header = request.headers.get('Stripe-Signature', '')
+
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Stripe not configured"}), 503
+
+    # Verify webhook signature
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        except stripe.SignatureVerificationError:
+            logging.warning("Stripe webhook signature verification failed")
+            return jsonify({"error": "Invalid signature"}), 400
+        except Exception as e:
+            logging.error(f"Stripe webhook error: {e}")
+            return jsonify({"error": "Webhook error"}), 400
+    else:
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            return jsonify({"error": "Invalid payload"}), 400
+
+    event_type = event.get("type", "")
+    data_obj = event.get("data", {}).get("object", {})
+
+    logging.info(f"Stripe webhook received: {event_type}")
+
+    try:
+        if event_type == "checkout.session.completed":
+            metadata = data_obj.get("metadata", {})
+            group_id = metadata.get("group_id")
+            user_id = metadata.get("user_id")
+            plan_key = metadata.get("plan_key", "")
+            subscription_id = data_obj.get("subscription")
+            customer_id = data_obj.get("customer")
+
+            if group_id and subscription_id:
+                # Retrieve the subscription to get period details
+                try:
+                    sub_obj = stripe.Subscription.retrieve(subscription_id)
+                    period_end = datetime.datetime.fromtimestamp(
+                        sub_obj.current_period_end, tz=datetime.timezone.utc
+                    )
+                except Exception as e:
+                    logging.error(f"Could not retrieve subscription {subscription_id}: {e}")
+                    period_end = None
+
+                upsert_group_subscription(
+                    group_id=int(group_id),
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=subscription_id,
+                    plan_type=plan_key,
+                    status="active",
+                    current_period_end=period_end,
+                    created_by=int(user_id) if user_id else None,
+                )
+                logging.info(f"Subscription activated for group {group_id} via checkout")
+
+                # Notify the admin
+                if user_id:
+                    try:
+                        plan_label = SUBSCRIPTION_PLANS.get(plan_key, {}).get("label", plan_key)
+                        bot.send_message(
+                            int(user_id),
+                            f"✅ **Payment Successful!**\n\n"
+                            f"Your subscription ({plan_label}) for group `{group_id}` is now active.\n\n"
+                            f"You can now use /gsconfig to configure the bot.",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as notify_e:
+                        logging.warning(f"Could not notify user {user_id}: {notify_e}")
+
+        elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
+            subscription_id = data_obj.get("id")
+            status = data_obj.get("status", "inactive")
+            metadata = data_obj.get("metadata", {})
+            group_id = metadata.get("group_id")
+
+            if not group_id:
+                # Try to find group by subscription ID
+                with get_db_cursor() as (conn, cur):
+                    cur.execute(
+                        "SELECT group_id FROM group_subscriptions WHERE stripe_subscription_id = %s",
+                        (subscription_id,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        group_id = str(row[0])
+
+            if group_id:
+                period_end = None
+                if data_obj.get("current_period_end"):
+                    period_end = datetime.datetime.fromtimestamp(
+                        data_obj["current_period_end"], tz=datetime.timezone.utc
+                    )
+
+                # Map Stripe statuses to our internal statuses
+                status_map = {
+                    "active": "active",
+                    "past_due": "past_due",
+                    "canceled": "canceled",
+                    "unpaid": "inactive",
+                    "incomplete": "inactive",
+                    "incomplete_expired": "inactive",
+                    "trialing": "trialing",
+                    "paused": "inactive",
+                }
+                mapped_status = status_map.get(status, "inactive")
+
+                upsert_group_subscription(
+                    group_id=int(group_id),
+                    stripe_subscription_id=subscription_id,
+                    status=mapped_status,
+                    current_period_end=period_end,
+                )
+                logging.info(f"Subscription {subscription_id} updated for group {group_id}: {mapped_status}")
+
+        elif event_type == "invoice.paid":
+            subscription_id = data_obj.get("subscription")
+            if subscription_id:
+                try:
+                    sub_obj = stripe.Subscription.retrieve(subscription_id)
+                    metadata = sub_obj.get("metadata", {})
+                    group_id = metadata.get("group_id")
+                    if group_id:
+                        period_end = datetime.datetime.fromtimestamp(
+                            sub_obj.current_period_end, tz=datetime.timezone.utc
+                        )
+                        upsert_group_subscription(
+                            group_id=int(group_id),
+                            status="active",
+                            current_period_end=period_end,
+                        )
+                        logging.info(f"Invoice paid — subscription renewed for group {group_id}")
+                except Exception as e:
+                    logging.error(f"Error processing invoice.paid: {e}")
+
+        elif event_type == "invoice.payment_failed":
+            subscription_id = data_obj.get("subscription")
+            if subscription_id:
+                with get_db_cursor() as (conn, cur):
+                    cur.execute(
+                        "SELECT group_id, created_by FROM group_subscriptions WHERE stripe_subscription_id = %s",
+                        (subscription_id,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        group_id, created_by = row
+                        upsert_group_subscription(group_id=group_id, status="past_due")
+                        if created_by:
+                            try:
+                                bot.send_message(
+                                    int(created_by),
+                                    f"⚠️ **Payment Failed**\n\n"
+                                    f"The subscription payment for group `{group_id}` has failed.\n"
+                                    f"Please update your payment method to keep the bot active.\n\n"
+                                    f"Use /gsconfig in your group to manage your subscription.",
+                                    parse_mode="Markdown"
+                                )
+                            except Exception as notify_e:
+                                logging.warning(f"Could not notify user {created_by}: {notify_e}")
+
+    except Exception as e:
+        logging.error(f"Error processing Stripe webhook {event_type}: {e}")
+        return jsonify({"error": "Processing error"}), 500
+
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route('/subscription/success')
+def subscription_success():
+    """Landing page after successful Stripe checkout."""
+    group_id = request.args.get('group_id', '')
+    return f"""<!DOCTYPE html>
+<html><head><title>Subscription Activated</title>
+<style>body{{font-family:sans-serif;text-align:center;padding:60px 20px;background:#0a0a0a;color:#fff}}
+h1{{color:#4CAF50}}a{{color:#2196F3;text-decoration:none}}</style></head>
+<body><h1>✅ Payment Successful!</h1>
+<p>Your subscription is now active.</p>
+<p>Return to Telegram and use <code>/gsconfig</code> in your group to configure the bot.</p>
+</body></html>"""
+
+
+@app.route('/subscription/cancel')
+def subscription_cancel():
+    """Landing page after cancelled Stripe checkout."""
+    return """<!DOCTYPE html>
+<html><head><title>Payment Cancelled</title>
+<style>body{font-family:sans-serif;text-align:center;padding:60px 20px;background:#0a0a0a;color:#fff}
+h1{color:#FF9800}a{color:#2196F3;text-decoration:none}</style></head>
+<body><h1>⚠️ Payment Cancelled</h1>
+<p>Your payment was not completed.</p>
+<p>Return to Telegram and use <code>/gsconfig</code> to try again.</p>
+</body></html>"""
 
 
 @app.route('/health')
