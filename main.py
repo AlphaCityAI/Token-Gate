@@ -6214,20 +6214,24 @@ def stripe_webhook():
     if not STRIPE_SECRET_KEY:
         return jsonify({"error": "Stripe not configured"}), 503
 
-    if STRIPE_WEBHOOK_SECRET:
-        try:
-            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        except stripe.SignatureVerificationError:
-            logging.warning("Stripe webhook signature verification failed")
-            return jsonify({"error": "Invalid signature"}), 400
-        except Exception as e:
-            logging.error(f"Stripe webhook error: {e}")
-            return jsonify({"error": "Webhook error"}), 400
-    else:
-        try:
-            event = json.loads(payload)
-        except Exception:
-            return jsonify({"error": "Invalid payload"}), 400
+    # STRIPE_WEBHOOK_SECRET is required.  Without it we cannot verify that a
+    # request genuinely originated from Stripe, so we refuse all webhook
+    # traffic rather than falling back to processing unsigned payloads.
+    if not STRIPE_WEBHOOK_SECRET:
+        logging.error(
+            "Received POST /stripe/webhook but STRIPE_WEBHOOK_SECRET is not set. "
+            "All webhook requests are rejected until the secret is configured."
+        )
+        return jsonify({"error": "Webhook secret not configured"}), 503
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except stripe.SignatureVerificationError:
+        logging.warning("Stripe webhook signature verification failed")
+        return jsonify({"error": "Invalid signature"}), 400
+    except Exception as e:
+        logging.error(f"Stripe webhook error: {e}")
+        return jsonify({"error": "Webhook error"}), 400
 
     if event.get("type") == "checkout.session.completed":
         session_data = event["data"]["object"]
