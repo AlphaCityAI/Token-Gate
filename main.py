@@ -27,8 +27,8 @@ import psutil
 import stripe
 from waitress import serve as waitress_serve
 
-# Note: get_user_nft_trait_count, get_user_nft_category_count are defined
-
+# Note: get_user_nft_trait_count and get_user_nft_category_count are defined
+# later in this file (see the "NFT trait helpers" section around line 3600+).
 # ==================== Global Constants ===========================
 CACHE_TTL = 1200      # Cache Time-To-Live in seconds (20 minutes)
 VERIFICATION_CACHE_TTL = 60  # Freshness target for interactive verification checks
@@ -203,6 +203,7 @@ sui_rpc_session.mount('https://', adapter)
 # ==================== Database Setup =============================
 db_lock = threading.Lock()
 config_lock = threading.Lock()
+cache_lock = threading.Lock()  # Protects balance_cache and nft_cache across threads
 database_url = os.getenv('DATABASE_URL')
 if not database_url:
     raise ValueError("DATABASE_URL not found in environment variables")
@@ -964,7 +965,6 @@ def toggle_user_exemption(group_id, user_id, exempt_status):
 SUBSCRIBER_CONFIGS = load_configs_from_db()
 balance_cache = {}
 nft_cache = {}
-cache_lock = threading.Lock()  # Protects balance_cache and nft_cache across threads
 last_registration_prompt = {}
 
 # ==================== Cleanup Functions =============================
@@ -6615,7 +6615,7 @@ if __name__ == "__main__":
 
     flask_thread = threading.Thread(
         target=lambda: waitress_serve(app, host=HOST, port=PORT, threads=4),
-        name="flask-waitress",
+        name="waitress-server",
     )
     flask_thread.daemon = True
     flask_thread.start()
