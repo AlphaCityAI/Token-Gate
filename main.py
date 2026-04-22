@@ -982,6 +982,13 @@ def cleanup_expired_data():
     except Exception as e:
         logging.error(f"Error cleaning up expired verifications from DB: {e}")
 
+# ==================== CITY Staking Constants ==========================
+# Full coin type for the $CITY token on Sui mainnet.
+CITY_TOKEN_TYPE = "0x308fa16c7aead43e3a49a4ff2e76205ba2a12697234f4fe80a2da66515284060::city::CITY"
+# Staking contract package that issues UserStake receipts for locked $CITY.
+CITY_STAKING_PACKAGE = "0x008856d5d6d60a088f6153dbe6f7697d19f81d1d0403695c9e9fbaecdc8b29a9"
+CITY_STAKING_TYPE = f"{CITY_STAKING_PACKAGE}::city_staking::UserStake<{CITY_TOKEN_TYPE}>"
+
 # ==================== fetch_wallet_balances Function =================
 def make_api_request_with_retry(request_callable, max_retries: int = 3, base_delay: int = 1):
     """Run a request callable with exponential backoff retry logic."""
@@ -1046,6 +1053,16 @@ def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, 
             logging.error(f"Failed to fetch on-chain balance for {wallet_lower}: {e}")
             results[wallet_lower] = None
 
+    if monitored_token == CITY_TOKEN_TYPE:
+        for wallet_lower in list(results.keys()):
+            if results[wallet_lower] is None:
+                continue
+            staked = _fetch_staked_city_balance(wallet_lower, decimals)
+            if staked is not None:
+                results[wallet_lower] = results[wallet_lower] + staked
+            else:
+                logging.warning(f"Could not fetch staked CITY for {wallet_lower}; using base balance only.")
+
     if len(balance_cache) >= MAX_CACHE_SIZE:
         sorted_keys = sorted(balance_cache.keys(), key=lambda k: balance_cache[k][0])
         for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
@@ -1053,6 +1070,53 @@ def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, 
 
     balance_cache[cache_key] = (current_time, results)
     return results
+
+
+def _fetch_staked_city_balance(address: str, decimals: int) -> float | None:
+    """
+    Return the total staked $CITY balance for *address* by summing all
+    ``UserStake`` objects owned by that wallet.
+
+    Returns the human-readable float (i.e. divided by 10**decimals), or
+    ``None`` when the RPC call fails so the caller can decide whether to
+    treat the failure as non-fatal.
+    """
+    total_atomic = 0
+    cursor = None
+    try:
+        while True:
+            params = [
+                address,
+                {
+                    "filter": {"StructType": CITY_STAKING_TYPE},
+                    "options": {"showContent": True},
+                },
+                cursor,
+                50,
+            ]
+            result = sui_rpc_request("suix_getOwnedObjects", params)
+            if not result:
+                break
+            for item in result.get("data", []):
+                fields = (
+                    ((item.get("data") or {}).get("content") or {}).get("fields") or {}
+                )
+                staked_amount = fields.get("staked_amount")
+                if staked_amount is None:
+                    # Older contract version stores it inside a Balance<CITY> struct.
+                    principal = fields.get("principal") or {}
+                    if isinstance(principal, dict):
+                        staked_amount = (principal.get("fields") or {}).get("value")
+                if staked_amount is not None:
+                    total_atomic += int(staked_amount)
+            if not result.get("hasNextPage"):
+                break
+            cursor = result.get("nextCursor")
+    except Exception as e:
+        logging.error(f"Failed to fetch staked CITY balance for {address}: {e}")
+        return None
+    return total_atomic / (10 ** decimals)
+
 
 # ==================== Periodic Tasks ==============================
 def check_group_holdings():
@@ -5791,6 +5855,46 @@ def wallet_connect_webapp():
         result.tokenBalance = null;
       }}
       $fill.style.width = '50%';
+
+      // Step: add staked $CITY to the balance when the configured token is $CITY
+      const CITY_TOKEN = '0x308fa16c7aead43e3a49a4ff2e76205ba2a12697234f4fe80a2da66515284060::city::CITY';
+      const CITY_STAKING_PKG = '0x008856d5d6d60a088f6153dbe6f7697d19f81d1d0403695c9e9fbaecdc8b29a9';
+      if (TOKEN_TYPE === CITY_TOKEN && result.tokenBalance !== null) {{
+        $status.textContent = 'Checking staked $CITY…';
+        try {{
+          const stakingType = CITY_STAKING_PKG + '::city_staking::UserStake<' + CITY_TOKEN + '>';
+          let stakedAtomic = BigInt(0);
+          let stakeCursor = null;
+          do {{
+            const stakePage = await suiRpc('suix_getOwnedObjects', [
+              wallet,
+              {{ filter: {{ StructType: stakingType }}, options: {{ showContent: true }} }},
+              stakeCursor,
+              50
+            ]);
+            const stakeItems = stakePage.data || [];
+            for (const item of stakeItems) {{
+              const fields = (((item.data || {{}}).content || {{}}).fields) || {{}};
+              let staked = fields.staked_amount;
+              if (staked == null) {{
+                const principal = fields.principal || {{}};
+                staked = ((principal.fields || {{}}).value);
+              }}
+              if (staked != null) stakedAtomic += BigInt(staked);
+            }}
+            stakeCursor = stakePage.hasNextPage ? stakePage.nextCursor : null;
+          }} while (stakeCursor);
+
+          const divisor = BigInt(Math.pow(10, DECIMALS));
+          const stakedIntPart = Number(stakedAtomic / divisor);
+          const stakedFracPart = Number(stakedAtomic % divisor) / Number(divisor);
+          result.tokenBalance += stakedIntPart + stakedFracPart;
+          result.tokenOk = result.tokenBalance >= MIN_HOLDING;
+        }} catch (e) {{
+          console.warn('Failed to fetch staked CITY balance:', e);
+          // Non-fatal: proceed with the liquid balance only.
+        }}
+      }}
     }}
 
     // Step: NFT ownership check
