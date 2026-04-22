@@ -24,6 +24,7 @@ import functools
 import datetime
 import gc
 import psutil
+import stripe
 
 from src.nft_traits import get_user_nft_trait_count, get_user_nft_category_count, check_nft_trait_ownership
 
@@ -67,6 +68,32 @@ WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '').strip()
 # Allowed origin for CORS on /api/verify.  Defaults to '*' (any origin) which is safe
 # for this credential-free JSON API, but can be restricted to a specific domain.
 CORS_ALLOWED_ORIGIN = os.getenv('CORS_ALLOWED_ORIGIN', '*').strip() or '*'
+
+# ==================== Stripe Configuration ========================
+STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY', '').strip()
+STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET', '').strip()
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+# ==================== Bot Owner & Whitelist =======================
+# Telegram user ID of the bot owner (for subscription management).
+BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '0'))
+
+# Groups that can use the bot WITHOUT an active subscription.
+# Edit this set directly in code to add/remove whitelisted group IDs.
+# This is intentionally kept at the code level for security, as the bot
+# owner requested. Alternatively, populate from an environment variable:
+#   WHITELISTED_GROUPS = set(int(g) for g in os.getenv('WHITELISTED_GROUPS', '').split(',') if g.strip())
+WHITELISTED_GROUPS: set[int] = {
+    # Example: -1001234567890,
+}
+
+# Subscription pricing tiers (amount in cents)
+SUBSCRIPTION_TIERS = {
+    "1month": {"label": "1 Month", "price_cents": 399, "days": 30, "display": "$3.99"},
+    "3month": {"label": "3 Months", "price_cents": 1199, "days": 90, "display": "$11.99"},
+    "6month": {"label": "6 Months", "price_cents": 2199, "days": 180, "display": "$21.99"},
+}
 
 BOT_NAME = "GuildSafeBot"
 CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
@@ -417,6 +444,16 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                group_id BIGINT PRIMARY KEY,
+                stripe_session_id TEXT,
+                tier TEXT,
+                activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                activated_by BIGINT
+            )
+        """)
         try:
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS auto_remove BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_collection_id TEXT DEFAULT ''")
@@ -729,6 +766,113 @@ def get_user_cached_holdings(group_id, user_id):
         if result:
             return {"nft_count": result[0], "trait_count": result[1], "token_balance": result[2]}
     return None
+
+# ==================== Subscription Helpers ========================
+
+def is_group_whitelisted(group_id):
+    """Check if a group is in the owner-controlled whitelist."""
+    return int(group_id) in WHITELISTED_GROUPS
+
+@db_retry
+def get_group_subscription(group_id):
+    """Return the subscription row for a group, or None."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT group_id, stripe_session_id, tier, activated_at, expires_at, activated_by "
+            "FROM subscriptions WHERE group_id = %s",
+            (group_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            return {
+                "group_id": row[0],
+                "stripe_session_id": row[1],
+                "tier": row[2],
+                "activated_at": row[3],
+                "expires_at": row[4],
+                "activated_by": row[5],
+            }
+    return None
+
+def group_has_active_subscription(group_id):
+    """Return True if the group has a non-expired subscription or is whitelisted."""
+    if is_group_whitelisted(group_id):
+        return True
+    sub = get_group_subscription(group_id)
+    if sub and sub["expires_at"]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expires = sub["expires_at"]
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=datetime.timezone.utc)
+        return now < expires
+    return False
+
+@db_retry
+def activate_subscription(group_id, stripe_session_id, tier, activated_by):
+    """Create or extend a subscription for a group."""
+    tier_info = SUBSCRIPTION_TIERS.get(tier)
+    if not tier_info:
+        raise ValueError(f"Unknown subscription tier: {tier}")
+    days = tier_info["days"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # If there's an existing active subscription, extend from its expiry
+    existing = get_group_subscription(group_id)
+    if existing and existing["expires_at"]:
+        existing_exp = existing["expires_at"]
+        if existing_exp.tzinfo is None:
+            existing_exp = existing_exp.replace(tzinfo=datetime.timezone.utc)
+        if existing_exp > now:
+            new_expiry = existing_exp + datetime.timedelta(days=days)
+        else:
+            new_expiry = now + datetime.timedelta(days=days)
+    else:
+        new_expiry = now + datetime.timedelta(days=days)
+    with get_db_cursor() as (conn, cur):
+        cur.execute("""
+            INSERT INTO subscriptions (group_id, stripe_session_id, tier, activated_at, expires_at, activated_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (group_id) DO UPDATE SET
+                stripe_session_id = EXCLUDED.stripe_session_id,
+                tier = EXCLUDED.tier,
+                activated_at = EXCLUDED.activated_at,
+                expires_at = EXCLUDED.expires_at,
+                activated_by = EXCLUDED.activated_by
+        """, (group_id, stripe_session_id, tier, now, new_expiry, activated_by))
+    logging.info(f"Subscription activated for group {group_id}: tier={tier}, expires={new_expiry}")
+    return new_expiry
+
+def create_stripe_checkout_session(group_id, user_id, tier):
+    """Create a Stripe Checkout Session for a subscription purchase."""
+    if not STRIPE_SECRET_KEY:
+        raise RuntimeError("Stripe is not configured. Ensure STRIPE_SECRET_KEY is set in environment variables.")
+    tier_info = SUBSCRIPTION_TIERS.get(tier)
+    if not tier_info:
+        raise ValueError(f"Unknown tier: {tier}")
+    # Determine success/cancel URL
+    base_url = get_public_webapp_base_url()
+    session = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": tier_info["price_cents"],
+                "product_data": {
+                    "name": f"GuildSafeBot – {tier_info['label']} Subscription",
+                    "description": f"Token-gating bot subscription for {tier_info['label'].lower()}",
+                },
+            },
+            "quantity": 1,
+        }],
+        mode="payment",
+        success_url=f"{base_url}/subscription/success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{base_url}/subscription/cancel",
+        metadata={
+            "group_id": str(group_id),
+            "user_id": str(user_id),
+            "tier": tier,
+        },
+    )
+    return session
 
 @db_retry
 def wallet_already_registered(wallet_address, group_id, user_id=None):
@@ -1375,6 +1519,94 @@ def vote_command(message):
             parse_mode="Markdown"
         )
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("subscribe_"))
+def handle_subscription_callback(call):
+    """Handle subscription tier selection callbacks."""
+    try:
+        parts = call.data.split("_")
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "❌ Invalid subscription action.")
+            return
+        group_id = int(parts[1])
+        tier = parts[2]
+
+        # Handle "back" action — re-show tier selection
+        if tier == "back":
+            bot.answer_callback_query(call.id)
+            try:
+                chat_obj = bot.get_chat(group_id)
+                group_name = chat_obj.title
+            except Exception:
+                group_name = f"Group {group_id}"
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            show_subscription_prompt(call.message.chat.id, group_id, group_name)
+            return
+
+        if tier not in SUBSCRIPTION_TIERS:
+            bot.answer_callback_query(call.id, "❌ Unknown subscription tier.")
+            return
+
+        user_id = call.from_user.id
+
+        # Verify user is admin of the group
+        try:
+            member = bot.get_chat_member(group_id, user_id)
+            if member.status not in ["creator", "administrator"]:
+                bot.answer_callback_query(call.id, "❌ Only group administrators can purchase subscriptions.")
+                return
+        except Exception:
+            bot.answer_callback_query(call.id, "❌ Could not verify admin status.")
+            return
+
+        bot.answer_callback_query(call.id, "⏳ Creating payment link…")
+
+        if not STRIPE_SECRET_KEY:
+            bot.edit_message_text(
+                "❌ Payment system is not configured. Please contact the bot administrator.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+            return
+
+        try:
+            session = create_stripe_checkout_session(group_id, user_id, tier)
+            tier_info = SUBSCRIPTION_TIERS[tier]
+            try:
+                chat_obj = bot.get_chat(group_id)
+                group_name = chat_obj.title
+            except Exception:
+                group_name = f"Group {group_id}"
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("💳 Pay Now", url=session.url))
+            markup.add(types.InlineKeyboardButton("« Back", callback_data=f"subscribe_{group_id}_back"))
+            bot.edit_message_text(
+                f"💳 **Complete Your Payment**\n\n"
+                f"Plan: *{tier_info['label']}* — {tier_info['display']}\n"
+                f"Group: *{group_name}*\n\n"
+                f"Click the button below to complete your payment via Stripe.\n"
+                f"Once payment is confirmed, you'll be able to configure the bot.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Stripe checkout creation failed for group {group_id}: {e}")
+            bot.edit_message_text(
+                "❌ Error creating payment session. Please try again later.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+    except Exception as e:
+        logging.error(f"Error in subscription callback: {e}")
+        try:
+            bot.answer_callback_query(call.id, "❌ An error occurred.")
+        except Exception:
+            pass
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("privconfig_") or call.data.startswith("config_") or call.data.startswith("privvote_"))
 def handle_private_config_callback(call):
     """Handles ALL callbacks from the private configuration menu."""
@@ -1424,6 +1656,21 @@ def handle_private_config_callback(call):
                 return
 
         bot.answer_callback_query(call.id, "⏳ Processing…")
+
+        # --- Subscription gate for config actions ---
+        if call.data.startswith("privconfig_") or call.data.startswith("config_"):
+            if not group_has_active_subscription(group_id):
+                try:
+                    chat_obj = bot.get_chat(group_id)
+                    gname = chat_obj.title
+                except Exception:
+                    gname = f"Group {group_id}"
+                try:
+                    bot.delete_message(call.message.chat.id, call.message.message_id)
+                except Exception:
+                    pass
+                show_subscription_prompt(call.message.chat.id, group_id, gname)
+                return
 
         # --- THE REST OF THE FUNCTION LOGIC REMAINS THE SAME ---
         # (This combines the logic from the deleted function with the new one)
@@ -1900,6 +2147,38 @@ def create_registration_link(group_id, send_to_chat_id=None):
             logging.error(f"Failed to send error message: {fallback_e}")
         return False
 
+def show_subscription_prompt(chat_id, group_id, group_name):
+    """Show subscription tier selection when group has no active subscription."""
+    sub = get_group_subscription(group_id)
+    if sub and sub["expires_at"]:
+        exp = sub["expires_at"]
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=datetime.timezone.utc)
+        status_line = f"\n⏰ Your previous subscription expired on {exp.strftime('%Y-%m-%d')}.\n"
+    else:
+        status_line = ""
+
+    markup = types.InlineKeyboardMarkup()
+    for tier_key, tier_info in SUBSCRIPTION_TIERS.items():
+        markup.add(types.InlineKeyboardButton(
+            f"💳 {tier_info['label']} — {tier_info['display']}",
+            callback_data=f"subscribe_{group_id}_{tier_key}"
+        ))
+
+    bot.send_message(
+        chat_id,
+        f"🔒 **Subscription Required**\n\n"
+        f"To configure and use GuildSafeBot in *{group_name}*, "
+        f"an active subscription is required.\n"
+        f"{status_line}\n"
+        f"Choose a plan below:\n\n"
+        f"• 1 Month — $3.99\n"
+        f"• 3 Months — $11.99\n"
+        f"• 6 Months — $21.99\n",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
 def show_config_menu_private(chat_id, group_id):
     """Show configuration menu in private chat for a specific group"""
     try:
@@ -1910,6 +2189,11 @@ def show_config_menu_private(chat_id, group_id):
         except Exception as e:
             logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
+
+        # --- Subscription gate ---
+        if not group_has_active_subscription(group_id):
+            show_subscription_prompt(chat_id, group_id, group_name)
+            return
 
         # Store the group context for this user
         with get_db_cursor() as (conn, cur):
@@ -5917,6 +6201,117 @@ def api_verify():
         logging.error(f"Error in api_verify: {e}")
         resp = jsonify({'success': False, 'error': 'Internal server error'})
         return _add_cors_headers(resp), 500
+
+
+# ==================== Stripe Webhook & Subscription Routes ========
+
+@app.route('/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    """Handle Stripe webhook events for payment completion."""
+    payload = request.get_data()
+    sig_header = request.headers.get('Stripe-Signature', '')
+
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Stripe not configured"}), 503
+
+    # STRIPE_WEBHOOK_SECRET is required.  Without it we cannot verify that a
+    # request genuinely originated from Stripe, so we refuse all webhook
+    # traffic rather than falling back to processing unsigned payloads.
+    if not STRIPE_WEBHOOK_SECRET:
+        logging.error(
+            "Received POST /stripe/webhook but STRIPE_WEBHOOK_SECRET is not set. "
+            "All webhook requests are rejected until the secret is configured."
+        )
+        return jsonify({"error": "Webhook secret not configured"}), 503
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except stripe.SignatureVerificationError:
+        logging.warning("Stripe webhook signature verification failed")
+        return jsonify({"error": "Invalid signature"}), 400
+    except Exception as e:
+        logging.error(f"Stripe webhook error: {e}")
+        return jsonify({"error": "Webhook error"}), 400
+
+    if event.get("type") == "checkout.session.completed":
+        session_data = event["data"]["object"]
+        metadata = session_data.get("metadata", {})
+        group_id_str = metadata.get("group_id")
+        user_id_str = metadata.get("user_id")
+        tier = metadata.get("tier")
+
+        if group_id_str and tier:
+            try:
+                group_id = int(group_id_str)
+                user_id = int(user_id_str) if user_id_str else 0
+                new_expiry = activate_subscription(group_id, session_data.get("id", ""), tier, user_id)
+                logging.info(f"Stripe payment completed: group={group_id}, tier={tier}, expires={new_expiry}")
+
+                # Notify the user via Telegram
+                if user_id:
+                    try:
+                        tier_info = SUBSCRIPTION_TIERS.get(tier, {})
+                        try:
+                            chat_obj = bot.get_chat(group_id)
+                            gname = chat_obj.title
+                        except Exception:
+                            gname = f"Group {group_id}"
+                        bot.send_message(
+                            user_id,
+                            f"✅ **Payment Confirmed!**\n\n"
+                            f"Your *{tier_info.get('label', tier)}* subscription for "
+                            f"*{gname}* is now active.\n\n"
+                            f"📅 Expires: {new_expiry.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                            f"You can now use /gsconfig to configure the bot.",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as notify_e:
+                        logging.warning(f"Could not notify user {user_id} about subscription: {notify_e}")
+            except (ValueError, TypeError) as e:
+                logging.error(f"Invalid metadata in Stripe webhook: {e}")
+        else:
+            logging.warning(f"Stripe checkout.session.completed missing metadata: {metadata}")
+
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route('/subscription/success')
+def subscription_success():
+    """Simple success landing page after Stripe Checkout."""
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<title>Payment Successful</title>'
+        '<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;'
+        'justify-content:center;min-height:100vh;margin:0;background:#f0f9f0;}'
+        '.card{background:#fff;border-radius:12px;padding:2rem;text-align:center;'
+        'box-shadow:0 2px 10px rgba(0,0,0,.1);max-width:420px}'
+        'h1{color:#22c55e;margin:0 0 .5rem}p{color:#555;line-height:1.5}'
+        '</style></head><body><div class="card">'
+        '<h1>✅ Payment Successful</h1>'
+        '<p>Your GuildSafeBot subscription is now active.</p>'
+        '<p>Return to Telegram and run <b>/gsconfig</b> to configure your group.</p>'
+        '</div></body></html>'
+    ), 200
+
+
+@app.route('/subscription/cancel')
+def subscription_cancel():
+    """Simple cancel landing page if user aborts Stripe Checkout."""
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<title>Payment Cancelled</title>'
+        '<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;'
+        'justify-content:center;min-height:100vh;margin:0;background:#fff5f5;}'
+        '.card{background:#fff;border-radius:12px;padding:2rem;text-align:center;'
+        'box-shadow:0 2px 10px rgba(0,0,0,.1);max-width:420px}'
+        'h1{color:#ef4444;margin:0 0 .5rem}p{color:#555;line-height:1.5}'
+        '</style></head><body><div class="card">'
+        '<h1>❌ Payment Cancelled</h1>'
+        '<p>No charges were made. You can try again anytime by running <b>/gsconfig</b> in your Telegram group.</p>'
+        '</div></body></html>'
+    ), 200
 
 
 @app.route('/health')
