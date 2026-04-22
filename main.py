@@ -25,15 +25,16 @@ import datetime
 import gc
 import psutil
 import stripe
+from waitress import serve as waitress_serve
 
-from src.nft_traits import get_user_nft_trait_count, get_user_nft_category_count, check_nft_trait_ownership
+# Note: get_user_nft_trait_count, get_user_nft_category_count are defined
 
 # ==================== Global Constants ===========================
 CACHE_TTL = 1200      # Cache Time-To-Live in seconds (20 minutes)
 VERIFICATION_CACHE_TTL = 60  # Freshness target for interactive verification checks
 NFT_CACHE_TTL = 43200   # Cache Time-To-Live for NFTs in seconds (12 hours)
 API_TIMEOUT = 60        # Timeout for API calls in seconds
-SLEEP_BETWEEN_TASKS = 172800 # Interval (seconds) for periodic tasks (12 hours)
+SLEEP_BETWEEN_TASKS = 172800 # Interval (seconds) for periodic tasks (48 hours)
 BOT_POLLING_TIMEOUT = 30  # Bot polling timeout (seconds)
 BOT_LONG_POLLING_TIMEOUT = 10 # Bot long polling timeout (seconds)
 REMINDER_THRESHOLD = 1200   # Reminder threshold in seconds (20 minutes)
@@ -253,7 +254,7 @@ def db_retry(func):
 
 def get_connection_pool():
     global connection_pool, database_url
-    # Test an existing connection pool less aggressively
+    # Fast path: test an existing connection pool without holding the creation lock.
     if connection_pool:
         try:
             conn = connection_pool.getconn()
@@ -275,82 +276,91 @@ def get_connection_pool():
                 logging.error(f"Error closing connections: {close_ex}")
             connection_pool = None
 
-    # Create a new connection pool with exponential back-off.
-    # Use the original database_url directly without modification for production
-    if not database_url:
-        raise Exception("DATABASE_URL is not set")
-    connection_string: str = database_url
-
-    # Add SSL mode if not present (required for Neon)
-    if 'sslmode=' not in connection_string:
-        separator = '&' if '?' in connection_string else '?'
-        connection_string = connection_string + f"{separator}sslmode=require"
-
-    # Only use pooler for specific cases, not for production databases
-    if '-pooler.' not in connection_string and 'neon.tech' in connection_string:
-        # For Neon databases, add endpoint parameter for SNI support
-        endpoint_match = re.search(r'@([^.]+)\.', connection_string)
-        if endpoint_match:
-            endpoint_id = endpoint_match.group(1)
-            separator = '&' if '?' in connection_string else '?'
-            connection_string = connection_string + f"{separator}options=endpoint%3D{endpoint_id}"
-            logging.info(f"Added Neon endpoint parameter: {endpoint_id}")
-
-    logging.info(f"Final connection string (masked): {connection_string.split('@')[0]}@[MASKED]")
-
-    tries = 0
-    max_tries = 5
-    backoff_time = 2
-    while tries < max_tries:
-        try:
-            # Use the connection string directly with psycopg2 pool
-            connection_pool = pool.ThreadedConnectionPool(
-                DB_POOL_MIN, DB_POOL_MAX,
-                connection_string,
-                connect_timeout=30,  # Increased timeout for production
-                application_name="wallet_alert_bot_production"
-            )
-            logging.info(f"Database connection pool created with {DB_POOL_MIN}-{DB_POOL_MAX} connections")
-            conn = connection_pool.getconn()
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                cur.fetchone()
-                cur.close()
-            finally:
-                connection_pool.putconn(conn)
-            logging.info("Created new database connection pool")
+    # Slow path: pool is None (or was just cleared).  Acquire db_lock so that
+    # two threads that simultaneously see connection_pool == None don't each
+    # create a separate pool, leaking connections.
+    with db_lock:
+        # Re-check inside the lock — another thread may have created the pool
+        # while we were waiting.
+        if connection_pool:
             return connection_pool
-        except Exception as e:
-            tries += 1
-            error_msg = str(e).lower()
 
-            # Handle specific authentication errors
-            if 'password authentication failed' in error_msg:
-                logging.error(f"Authentication failed - check DATABASE_URL credentials (attempt {tries}/{max_tries})")
-                # Try refreshing the DATABASE_URL from environment
-                fresh_url = os.getenv('DATABASE_URL')
-                if fresh_url and fresh_url != database_url:
-                    logging.info("Refreshing DATABASE_URL from environment")
-                    database_url = fresh_url
-                    connection_string = database_url
-                    if 'sslmode=' not in connection_string:
-                        separator = '&' if '?' in connection_string else '?'
-                        connection_string += f"{separator}sslmode=require"
-            else:
-                logging.error(f"Failed to create connection pool (attempt {tries}/{max_tries}): {e}")
+        # Create a new connection pool with exponential back-off.
+        # Use the original database_url directly without modification for production
+        if not database_url:
+            raise Exception("DATABASE_URL is not set")
+        connection_string: str = database_url
 
-            time.sleep(backoff_time)
-            backoff_time *= 1.5
-            if connection_pool:
+        # Add SSL mode if not present (required for Neon)
+        if 'sslmode=' not in connection_string:
+            separator = '&' if '?' in connection_string else '?'
+            connection_string = connection_string + f"{separator}sslmode=require"
+
+        # Only use pooler for specific cases, not for production databases
+        if '-pooler.' not in connection_string and 'neon.tech' in connection_string:
+            # For Neon databases, add endpoint parameter for SNI support
+            endpoint_match = re.search(r'@([^.]+)\.', connection_string)
+            if endpoint_match:
+                endpoint_id = endpoint_match.group(1)
+                separator = '&' if '?' in connection_string else '?'
+                connection_string = connection_string + f"{separator}options=endpoint%3D{endpoint_id}"
+                logging.info(f"Added Neon endpoint parameter: {endpoint_id}")
+
+        logging.info(f"Final connection string (masked): {connection_string.split('@')[0]}@[MASKED]")
+
+        tries = 0
+        max_tries = 5
+        backoff_time = 2
+        while tries < max_tries:
+            try:
+                # Use the connection string directly with psycopg2 pool
+                connection_pool = pool.ThreadedConnectionPool(
+                    DB_POOL_MIN, DB_POOL_MAX,
+                    connection_string,
+                    connect_timeout=30,  # Increased timeout for production
+                    application_name="wallet_alert_bot_production"
+                )
+                logging.info(f"Database connection pool created with {DB_POOL_MIN}-{DB_POOL_MAX} connections")
+                conn = connection_pool.getconn()
                 try:
-                    connection_pool.closeall()
-                except Exception:
-                    pass
-                connection_pool = None
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                    cur.close()
+                finally:
+                    connection_pool.putconn(conn)
+                logging.info("Created new database connection pool")
+                return connection_pool
+            except Exception as e:
+                tries += 1
+                error_msg = str(e).lower()
 
-    logging.error("Could not create database connection pool after multiple attempts")
-    raise Exception("Database connection failed")
+                # Handle specific authentication errors
+                if 'password authentication failed' in error_msg:
+                    logging.error(f"Authentication failed - check DATABASE_URL credentials (attempt {tries}/{max_tries})")
+                    # Try refreshing the DATABASE_URL from environment
+                    fresh_url = os.getenv('DATABASE_URL')
+                    if fresh_url and fresh_url != database_url:
+                        logging.info("Refreshing DATABASE_URL from environment")
+                        database_url = fresh_url
+                        connection_string = database_url
+                        if 'sslmode=' not in connection_string:
+                            separator = '&' if '?' in connection_string else '?'
+                            connection_string += f"{separator}sslmode=require"
+                else:
+                    logging.error(f"Failed to create connection pool (attempt {tries}/{max_tries}): {e}")
+
+                time.sleep(backoff_time)
+                backoff_time *= 1.5
+                if connection_pool:
+                    try:
+                        connection_pool.closeall()
+                    except Exception:
+                        pass
+                    connection_pool = None
+
+        logging.error("Could not create database connection pool after multiple attempts")
+        raise Exception("Database connection failed")
 
 @contextmanager
 def get_db_cursor():
@@ -954,6 +964,7 @@ def toggle_user_exemption(group_id, user_id, exempt_status):
 SUBSCRIBER_CONFIGS = load_configs_from_db()
 balance_cache = {}
 nft_cache = {}
+cache_lock = threading.Lock()  # Protects balance_cache and nft_cache across threads
 last_registration_prompt = {}
 
 # ==================== Cleanup Functions =============================
@@ -1037,10 +1048,11 @@ def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, 
 
     effective_cache_ttl = CACHE_TTL if cache_ttl is None else cache_ttl
 
-    if use_cache and cache_key in balance_cache:
-        cache_time, cache_result = balance_cache[cache_key]
-        if current_time - cache_time < effective_cache_ttl:
-            return cache_result
+    with cache_lock:
+        if use_cache and cache_key in balance_cache:
+            cache_time, cache_result = balance_cache[cache_key]
+            if current_time - cache_time < effective_cache_ttl:
+                return cache_result
 
     for wallet in addresses:
         wallet_lower = wallet.lower()
@@ -1063,12 +1075,13 @@ def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, 
             else:
                 logging.warning(f"Could not fetch staked CITY for {wallet_lower}; using base balance only.")
 
-    if len(balance_cache) >= MAX_CACHE_SIZE:
-        sorted_keys = sorted(balance_cache.keys(), key=lambda k: balance_cache[k][0])
-        for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
-            del balance_cache[old_key]
+    with cache_lock:
+        if len(balance_cache) >= MAX_CACHE_SIZE:
+            sorted_keys = sorted(balance_cache.keys(), key=lambda k: balance_cache[k][0])
+            for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
+                del balance_cache[old_key]
 
-    balance_cache[cache_key] = (current_time, results)
+        balance_cache[cache_key] = (current_time, results)
     return results
 
 
@@ -1318,19 +1331,32 @@ def check_user_wallets():
                                 logging.info(f"User {user_id} is in alert cooldown period. Skipping alert.")
                                 continue
 
-                            below_users_to_alert.append((user_id, total_balance))
+                            # Build a mode-appropriate description of what the user is missing
+                            if registration_mode == "token":
+                                failure_desc = f"{total_balance:,.2f} / {minimum_holding:,.2f} tokens"
+                            elif registration_mode == "nft":
+                                if user_nft_count is not None:
+                                    failure_desc = f"{user_nft_count} / {nft_threshold} NFTs"
+                                else:
+                                    failure_desc = "NFT check unavailable"
+                            else:  # "both"
+                                parts = [f"{total_balance:,.2f} tokens"]
+                                if user_nft_count is not None:
+                                    parts.append(f"{user_nft_count} NFTs")
+                                failure_desc = " | ".join(parts)
+                            below_users_to_alert.append((user_id, failure_desc))
 
                 # 5. Send one consolidated alert for all users not on cooldown
                 if not auto_remove and below_users_to_alert:
                     user_list = []
-                    for user_id, total in below_users_to_alert:
+                    for user_id, failure_desc in below_users_to_alert:
                         try:
                             user_info = bot.get_chat_member(group_id, user_id).user
                             username = user_info.username or user_info.first_name or f"User{user_id}"
                         except Exception as e:
                             logging.error(f"Error retrieving info for user {user_id}: {e}")
                             username = f"User{user_id}"
-                        user_list.append(f"*{username}*: {total:,.2f} tokens")
+                        user_list.append(f"*{username}*: {failure_desc}")
 
                     # Batch update the database for all users (reduces query count from N to 1)
                     try:
@@ -1350,7 +1376,7 @@ def check_user_wallets():
                         logging.error(f"Error tracking alerts for group {group_id}: {e}")
 
                     # Send alert to admins
-                    message = "🚨 *Low Token Holdings Alert*\n\n" + "\n".join(user_list)
+                    message = "🚨 *Low Holdings Alert*\n\n" + "\n".join(user_list)
                     try:
                         admins = bot.get_chat_administrators(group_id)
                         for admin in admins:
@@ -2887,9 +2913,7 @@ def process_set_token_config(message, group_id):
         return
 
     with config_lock:
-        if group_id not in SUBSCRIBER_CONFIGS:
-            SUBSCRIBER_CONFIGS[group_id] = {}
-            
+        ensure_config_exists(group_id)
         SUBSCRIBER_CONFIGS[group_id]['token'] = token
         SUBSCRIBER_CONFIGS[group_id]['minimum_holding'] = threshold
         SUBSCRIBER_CONFIGS[group_id]['decimals'] = decimals
@@ -3510,21 +3534,23 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None,
 
     effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
 
-    if use_cache and cache_key in nft_cache:
-        cache_time, cache_result = nft_cache[cache_key]
-        if current_time - cache_time < effective_cache_ttl:
-            return cache_result
+    with cache_lock:
+        if use_cache and cache_key in nft_cache:
+            cache_time, cache_result = nft_cache[cache_key]
+            if current_time - cache_time < effective_cache_ttl:
+                return cache_result
 
     try:
         nfts = _fetch_owned_nfts(normalized_addresses, collection_id, max_retries=max_retries)
         total_count = len(nfts)
 
-        if len(nft_cache) >= MAX_CACHE_SIZE:
-            sorted_keys = sorted(nft_cache.keys(), key=lambda k: nft_cache[k][0])
-            for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
-                del nft_cache[old_key]
+        with cache_lock:
+            if len(nft_cache) >= MAX_CACHE_SIZE:
+                sorted_keys = sorted(nft_cache.keys(), key=lambda k: nft_cache[k][0])
+                for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
+                    del nft_cache[old_key]
 
-        nft_cache[cache_key] = (current_time, total_count)
+            nft_cache[cache_key] = (current_time, total_count)
         return total_count
 
     except Exception as e:
@@ -4788,11 +4814,12 @@ def _add_cors_headers(response):
 @app.route('/')
 def home():
     with config_lock:
-        return jsonify({
-            "status": "running",
-            "bot_name": BOT_NAME,
-            "subscriber_configs": SUBSCRIBER_CONFIGS
-        })
+        group_count = len(SUBSCRIBER_CONFIGS)
+    return jsonify({
+        "status": "running",
+        "bot_name": BOT_NAME,
+        "configured_groups": group_count,
+    })
 
 @app.route('/wallet-connect')
 @app.route('/verify')
@@ -6531,18 +6558,20 @@ if __name__ == "__main__":
             # Cleanup old cache entries and expired data
             try:
                 # Clean balance cache
-                expired_balance_keys = [k for k, (cache_time, _) in balance_cache.items() 
-                                        if current_time - cache_time > CACHE_TTL * 2]
-                for key in expired_balance_keys:
-                    del balance_cache[key]
+                with cache_lock:
+                    expired_balance_keys = [k for k, (cache_time, _) in balance_cache.items() 
+                                            if current_time - cache_time > CACHE_TTL * 2]
+                    for key in expired_balance_keys:
+                        del balance_cache[key]
                 if expired_balance_keys:
                     logging.debug(f"Cleaned up {len(expired_balance_keys)} expired balance cache entries")
 
                 # Clean NFT cache
-                expired_nft_keys = [k for k, (cache_time, _) in nft_cache.items() 
-                                    if current_time - cache_time > NFT_CACHE_TTL * 2]
-                for key in expired_nft_keys:
-                    del nft_cache[key]
+                with cache_lock:
+                    expired_nft_keys = [k for k, (cache_time, _) in nft_cache.items() 
+                                        if current_time - cache_time > NFT_CACHE_TTL * 2]
+                    for key in expired_nft_keys:
+                        del nft_cache[key]
                 if expired_nft_keys:
                     logging.debug(f"Cleaned up {len(expired_nft_keys)} expired NFT cache entries")
 
@@ -6561,14 +6590,15 @@ if __name__ == "__main__":
                         if memory_mb > 500:  # 500MB threshold
                             logging.warning(f"High memory usage detected: {memory_mb:.1f}MB")
                             # Clear older cache entries more aggressively
-                            old_balance_keys = [k for k, (cache_time, _) in balance_cache.items() 
-                                                if current_time - cache_time > CACHE_TTL]
-                            for key in old_balance_keys:
-                                del balance_cache[key]
-                            old_nft_keys = [k for k, (cache_time, _) in nft_cache.items() 
-                                            if current_time - cache_time > NFT_CACHE_TTL // 2]
-                            for key in old_nft_keys:
-                                del nft_cache[key]
+                            with cache_lock:
+                                old_balance_keys = [k for k, (cache_time, _) in balance_cache.items() 
+                                                    if current_time - cache_time > CACHE_TTL]
+                                for key in old_balance_keys:
+                                    del balance_cache[key]
+                                old_nft_keys = [k for k, (cache_time, _) in nft_cache.items() 
+                                                if current_time - cache_time > NFT_CACHE_TTL // 2]
+                                for key in old_nft_keys:
+                                    del nft_cache[key]
                             if old_balance_keys or old_nft_keys:
                                 logging.info(f"Aggressive cleanup: removed {len(old_balance_keys)} balance, {len(old_nft_keys)} NFT cache entries")
                     except Exception as mem_e:
@@ -6583,7 +6613,10 @@ if __name__ == "__main__":
     keepalive_thread.daemon = True
     keepalive_thread.start()
 
-    flask_thread = threading.Thread(target=lambda: app.run(host=HOST, port=PORT, debug=False, threaded=True, use_reloader=False))
+    flask_thread = threading.Thread(
+        target=lambda: waitress_serve(app, host=HOST, port=PORT, threads=4),
+        name="flask-waitress",
+    )
     flask_thread.daemon = True
     flask_thread.start()
 
