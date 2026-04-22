@@ -176,6 +176,16 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
+# Lazily cached bot username – populated on first call to get_bot_username().
+_BOT_USERNAME = None
+
+def get_bot_username():
+    """Return the bot's Telegram username, caching it after the first API call."""
+    global _BOT_USERNAME
+    if _BOT_USERNAME is None:
+        _BOT_USERNAME = bot.get_me().username
+    return _BOT_USERNAME
+
 # ==================== API Session Setup =======================
 sui_rpc_session = requests.Session()
 sui_rpc_session.headers.update({
@@ -1811,6 +1821,7 @@ def handle_private_config_callback(call):
         bot.answer_callback_query(call.id, "❌ An error occurred.")
         
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mywallet_"))
 def handle_mywallets_callback(call):
     """Handles callbacks from the 'my wallets' private menu."""
     try:
@@ -1839,19 +1850,28 @@ def handle_mywallets_callback(call):
                 return
 
             markup = types.InlineKeyboardMarkup()
-            for wallet in wallets:
+            for i, wallet in enumerate(wallets):
                 display_wallet = f"{wallet[:8]}...{wallet[-6:]}"
-                callback_data = f"mywallet_{group_id}_dodelete_{wallet}"
+                callback_data = f"mywallet_{group_id}_dodelete_{i}"
                 markup.add(types.InlineKeyboardButton(f"🗑️ {display_wallet}", callback_data=callback_data))
 
             markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data=f"mywallet_{group_id}_back"))
             bot.edit_message_text("Select a wallet to remove:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
 
         elif action == "dodelete" and len(parts) == 4:
-            wallet_to_remove = parts[3]
+            try:
+                wallet_idx = int(parts[3])
+            except (ValueError, TypeError):
+                bot.answer_callback_query(call.id, "❌ Invalid wallet selection.")
+                return
             user_reg = get_user_registration(group_id, user_id)
             current_wallets = user_reg.get("wallets", []) if user_reg else []
 
+            if wallet_idx < 0 or wallet_idx >= len(current_wallets):
+                bot.answer_callback_query(call.id, "❌ Wallet not found.")
+                return
+
+            wallet_to_remove = current_wallets[wallet_idx]
             # Case-insensitive removal
             updated_wallets = [w for w in current_wallets if w.lower() != wallet_to_remove.lower()]
 
@@ -4111,12 +4131,15 @@ def handle_chat_member_update(update):
                 except Exception as pv_err:
                     logging.warning(f"Could not store pending verification for new member {user_id} in group {group_id}: {pv_err}")
 
-                # Create inline keyboard with registration button
+                # Create inline keyboard with registration button.
+                # Use a generic deep link so that each user who clicks it gets
+                # their own private verification session (via handle_start with
+                # the register_ param), preventing accidental cross-registration
+                # if the message is seen by other group members.
+                _bot_username = get_bot_username()
+                reg_link = f"https://t.me/{_bot_username}?start=register_{group_id}"
                 markup = types.InlineKeyboardMarkup()
-                # Build a direct verify URL so the user goes straight to
-                # the /verify page in their external browser.
-                verify_url = build_wallet_connect_url(group_id, user_id, cfg=config if config else None)
-                register_btn = types.InlineKeyboardButton("✅ Verify Wallet", url=verify_url)
+                register_btn = types.InlineKeyboardButton("✅ Verify Wallet", url=reg_link)
                 markup.add(register_btn)
 
                 # Send welcome message with registration prompt
@@ -4445,12 +4468,13 @@ def register_wallets(message):
 
     with config_lock:
         group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
-    # Always use a URL button so the /verify page opens in the user's
-    # external browser where wallet extensions are available.
-    connect_url = build_wallet_connect_url(group_id, user_id, cfg=group_cfg)
-    verify_url = f"{connect_url}&source=telegram_register"
+    # Use a generic deep link so each user who clicks the button starts their
+    # own private verification session under their own Telegram ID.  This
+    # prevents cross-registration if the group message is seen by other members.
+    bot_username = get_bot_username()
+    reg_link = f"https://t.me/{bot_username}?start=register_{group_id}"
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=verify_url))
+    markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=reg_link))
 
     message_thread_id = getattr(message, 'message_thread_id', None)
     register_text = (
