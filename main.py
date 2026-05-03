@@ -86,7 +86,7 @@ BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '0'))
 # owner requested. Alternatively, populate from an environment variable:
 #   WHITELISTED_GROUPS = set(int(g) for g in os.getenv('WHITELISTED_GROUPS', '').split(',') if g.strip())
 WHITELISTED_GROUPS: set[int] = {
-    # Example: -1001234567890,
+    -1002461611839
 }
 
 # Subscription pricing tiers (amount in cents)
