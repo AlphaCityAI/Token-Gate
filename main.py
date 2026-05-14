@@ -100,7 +100,7 @@ SUBSCRIPTION_TIERS = {
 BOT_NAME = "GuildSafeBot"
 CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
 ADMIN_MEMBER_STATUSES = frozenset({"creator", "administrator"})
-ACTIVE_GROUP_MEMBER_STATUSES = frozenset((*ADMIN_MEMBER_STATUSES, "member", "restricted"))
+ACTIVE_GROUP_MEMBER_STATUSES = frozenset({"creator", "administrator", "member", "restricted"})
 INACTIVE_MEMBER_STATUS_MESSAGES = {
     "left": "❌ That user has left this group.",
     "kicked": "❌ That user was removed from this group."
@@ -200,7 +200,7 @@ def get_telegram_user_display_name(user):
     full_name = " ".join(
         part for part in [user.first_name, getattr(user, "last_name", None)] if part
     ).strip()
-    return getattr(user, "username", None) or full_name or f"User{getattr(user, 'id', 'unknown')}"
+    return getattr(user, "username", None) or full_name or f"User{user.id}"
 
 # ==================== API Session Setup =======================
 sui_rpc_session = requests.Session()
@@ -3924,7 +3924,7 @@ def add_wallet_command(message):
             try:
                 target_user_id = int(command_parts[1].strip())
             except ValueError:
-                bot.reply_to(message, "❌ Invalid user ID. Please provide a numeric Telegram user ID.")
+                bot.reply_to(message, "❌ Invalid user ID format. Please provide a valid integer user ID.")
                 return
             if target_user_id <= 0:
                 bot.reply_to(message, "❌ Invalid user ID. Please provide a positive Telegram user ID.")
@@ -3943,9 +3943,13 @@ def add_wallet_command(message):
                     )
                     return
                 target_user = target_member.user
-            except Exception as e:
+            except telebot.apihelper.ApiTelegramException as e:
                 logging.error(f"Error fetching target user {target_user_id} for addwallet: {e}")
                 bot.reply_to(message, "❌ Could not find that user in this group. Please confirm the user ID.")
+                return
+            except Exception as e:
+                logging.error(f"Telegram lookup failed for target user {target_user_id} in addwallet: {e}")
+                bot.reply_to(message, "❌ Could not look up that user right now. Please try again.")
                 return
 
         chat_id = message.chat.id
