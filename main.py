@@ -193,7 +193,7 @@ def get_bot_username():
 
 def get_telegram_user_display_name(user):
     full_name = " ".join(
-        part for part in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if part
+        part for part in [user.first_name, getattr(user, "last_name", None)] if part
     ).strip()
     return getattr(user, "username", None) or full_name or f"User{getattr(user, 'id', 'unknown')}"
 
@@ -3926,7 +3926,14 @@ def add_wallet_command(message):
             try:
                 target_member = bot.get_chat_member(message.chat.id, target_user_id)
                 if target_member.status not in ACTIVE_GROUP_MEMBER_STATUSES:
-                    bot.reply_to(message, "❌ That user is not currently a member of this group.")
+                    status_messages = {
+                        "left": "❌ That user has left this group.",
+                        "kicked": "❌ That user was removed from this group."
+                    }
+                    bot.reply_to(
+                        message,
+                        status_messages.get(target_member.status, "❌ That user is not currently a member of this group.")
+                    )
                     return
                 target_user = target_member.user
             except Exception as e:
