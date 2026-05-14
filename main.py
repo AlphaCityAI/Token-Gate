@@ -99,8 +99,12 @@ SUBSCRIPTION_TIERS = {
 
 BOT_NAME = "GuildSafeBot"
 CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
-ADMIN_MEMBER_STATUSES = {"creator", "administrator"}
-ACTIVE_GROUP_MEMBER_STATUSES = ADMIN_MEMBER_STATUSES | {"member", "restricted"}
+ADMIN_MEMBER_STATUSES = frozenset({"creator", "administrator"})
+ACTIVE_GROUP_MEMBER_STATUSES = frozenset((*ADMIN_MEMBER_STATUSES, "member", "restricted"))
+INACTIVE_MEMBER_STATUS_MESSAGES = {
+    "left": "❌ That user has left this group.",
+    "kicked": "❌ That user was removed from this group."
+}
 
 # Maximum age (in seconds) for verify-page tokens used to authenticate
 # requests coming from the bot's own /verify page.
@@ -192,6 +196,7 @@ def get_bot_username():
 
 
 def get_telegram_user_display_name(user):
+    """Return the best available display name for a Telegram user."""
     full_name = " ".join(
         part for part in [user.first_name, getattr(user, "last_name", None)] if part
     ).strip()
@@ -3921,18 +3926,20 @@ def add_wallet_command(message):
             except ValueError:
                 bot.reply_to(message, "❌ Invalid user ID. Please provide a numeric Telegram user ID.")
                 return
+            if target_user_id <= 0:
+                bot.reply_to(message, "❌ Invalid user ID. Please provide a positive Telegram user ID.")
+                return
 
             wallet_address = command_parts[2].strip()
             try:
                 target_member = bot.get_chat_member(message.chat.id, target_user_id)
                 if target_member.status not in ACTIVE_GROUP_MEMBER_STATUSES:
-                    status_messages = {
-                        "left": "❌ That user has left this group.",
-                        "kicked": "❌ That user was removed from this group."
-                    }
                     bot.reply_to(
                         message,
-                        status_messages.get(target_member.status, "❌ That user is not currently a member of this group.")
+                        INACTIVE_MEMBER_STATUS_MESSAGES.get(
+                            target_member.status,
+                            "❌ That user is not currently a member of this group."
+                        )
                     )
                     return
                 target_user = target_member.user
