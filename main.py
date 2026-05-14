@@ -3916,7 +3916,7 @@ def add_wallet_command(message):
             wallet_address = command_parts[2].strip()
             try:
                 target_member = bot.get_chat_member(message.chat.id, target_user_id)
-                if target_member.status in ["left", "kicked"]:
+                if target_member.status not in ["creator", "administrator", "member", "restricted"]:
                     bot.reply_to(message, "❌ That user is not currently a member of this group.")
                     return
                 target_user = target_member.user
@@ -3926,12 +3926,10 @@ def add_wallet_command(message):
                 return
 
         chat_id = message.chat.id
-        target_user_name = (
-            target_user.username
-            or target_user.first_name
-            or getattr(target_user, "last_name", None)
-            or f"User{target_user.id}"
-        )
+        full_name = " ".join(
+            part for part in [target_user.first_name, getattr(target_user, "last_name", None)] if part
+        ).strip()
+        target_user_name = target_user.username or full_name or f"User{target_user.id}"
 
         if not is_valid_wallet_address(wallet_address):
             bot.reply_to(message, f"❌ Invalid wallet address format: '{wallet_address}'. Please check and try again.")
