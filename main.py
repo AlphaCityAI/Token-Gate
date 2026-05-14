@@ -1497,7 +1497,7 @@ def help_command(message):
         "👤 *User Management:*\n"
         "`/reminder` - Posts a public registration reminder in the chat.\n"
         "`/exempt` - Reply to a user's **recent message** to toggle their exemption from wallet rules.\n"
-        "`/addwallet` - Reply to a user's **recent message** to add a wallet for them. (e.g., `/addwallet 0x...`)\n\n"
+        "`/addwallet` - Add a wallet for a user by replying to their message or by user ID. (e.g., `/addwallet 123456789 0x...`)\n\n"
         "❓ For more assistance, please contact your group admin."
     )
     try:
@@ -3887,18 +3887,51 @@ def display_exemption_manager(group_id, send_to_chat_id):
 @admin_required
 def add_wallet_command(message):
     try:
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Please use this command by replying to a user's message.")
-            return
-
         command_parts = message.text.split()
-        if len(command_parts) < 2:
-            bot.reply_to(message, "❌ Usage: Reply to a user's message with `/addwallet <wallet_address>`")
-            return
+        usage_text = (
+            "❌ Usage:\n"
+            "• Reply to a user's message with `/addwallet <wallet_address>`\n"
+            "• Or run `/addwallet <user_id> <wallet_address>`"
+        )
 
-        wallet_address = command_parts[1].strip()
-        target_user = message.reply_to_message.from_user
+        target_user = None
+        wallet_address = ""
+
+        if message.reply_to_message:
+            if len(command_parts) < 2:
+                bot.reply_to(message, usage_text)
+                return
+            wallet_address = command_parts[1].strip()
+            target_user = message.reply_to_message.from_user
+        else:
+            if len(command_parts) < 3:
+                bot.reply_to(message, usage_text)
+                return
+            try:
+                target_user_id = int(command_parts[1].strip())
+            except ValueError:
+                bot.reply_to(message, "❌ Invalid user ID. Please provide a numeric Telegram user ID.")
+                return
+
+            wallet_address = command_parts[2].strip()
+            try:
+                target_member = bot.get_chat_member(message.chat.id, target_user_id)
+                if target_member.status in ["left", "kicked"]:
+                    bot.reply_to(message, "❌ That user is not currently a member of this group.")
+                    return
+                target_user = target_member.user
+            except Exception as e:
+                logging.error(f"Error fetching target user {target_user_id} for addwallet: {e}")
+                bot.reply_to(message, "❌ Could not find that user in this group. Please confirm the user ID.")
+                return
+
         chat_id = message.chat.id
+        target_user_name = (
+            target_user.username
+            or target_user.first_name
+            or getattr(target_user, "last_name", None)
+            or f"User{target_user.id}"
+        )
 
         if not is_valid_wallet_address(wallet_address):
             bot.reply_to(message, f"❌ Invalid wallet address format: '{wallet_address}'. Please check and try again.")
@@ -3908,7 +3941,7 @@ def add_wallet_command(message):
             bot.reply_to(message, "⚠️ This wallet address is already registered to another user in this group.")
             return
 
-        processing_msg = bot.reply_to(message, f"⏳ Adding wallet for {target_user.username or target_user.first_name}...")
+        processing_msg = bot.reply_to(message, f"⏳ Adding wallet for {target_user_name}...")
 
         with config_lock:
             cfg = SUBSCRIBER_CONFIGS.get(chat_id)
@@ -3916,7 +3949,7 @@ def add_wallet_command(message):
         success = save_wallet_for_user(
             chat_id, 
             target_user.id, 
-            target_user.username or target_user.first_name, 
+            target_user_name, 
             [wallet_address.lower()],
             replace_existing=False,
             registration_type=cfg.get("registration_mode", "token") if cfg else "token"
@@ -3935,13 +3968,13 @@ def add_wallet_command(message):
                 logging.error(f"Error getting wallet count: {e}")
 
             bot.edit_message_text(
-                f"✅ Successfully added wallet for {target_user.username or target_user.first_name}.\nThey now have {wallet_count} registered wallet(s).",
+                f"✅ Successfully added wallet for {target_user_name}.\nThey now have {wallet_count} registered wallet(s).",
                 chat_id=message.chat.id,
                 message_id=processing_msg.message_id
             )
         else:
             bot.edit_message_text(
-                f"❌ Failed to add wallet for {target_user.username or target_user.first_name}.\nPlease try again later.",
+                f"❌ Failed to add wallet for {target_user_name}.\nPlease try again later.",
                 chat_id=message.chat.id,
                 message_id=processing_msg.message_id
             )
@@ -6674,7 +6707,7 @@ if __name__ == "__main__":
                 telebot.types.BotCommand("vote", "Create a new poll (admins only)"),
                 telebot.types.BotCommand("reminder", "Send registration reminder (admins only)"),
                 telebot.types.BotCommand("exempt", "Exempt a user from wallet requirements (admins only)"),
-                telebot.types.BotCommand("addwallet", "Add wallet address for a user (admins only)"),
+                telebot.types.BotCommand("addwallet", "Add wallet for a user by reply or user ID (admins only)"),
                 telebot.types.BotCommand("confirm", "Finalize pending wallet verification")
             ]
             bot.set_my_commands(commands)
