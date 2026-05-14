@@ -99,6 +99,8 @@ SUBSCRIPTION_TIERS = {
 
 BOT_NAME = "GuildSafeBot"
 CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
+ADMIN_MEMBER_STATUSES = {"creator", "administrator"}
+ACTIVE_GROUP_MEMBER_STATUSES = ADMIN_MEMBER_STATUSES | {"member", "restricted"}
 
 # Maximum age (in seconds) for verify-page tokens used to authenticate
 # requests coming from the bot's own /verify page.
@@ -187,6 +189,13 @@ def get_bot_username():
     if _BOT_USERNAME is None:
         _BOT_USERNAME = bot.get_me().username
     return _BOT_USERNAME
+
+
+def get_telegram_user_display_name(user):
+    full_name = " ".join(
+        part for part in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if part
+    ).strip()
+    return getattr(user, "username", None) or full_name or f"User{getattr(user, 'id', 'unknown')}"
 
 # ==================== API Session Setup =======================
 sui_rpc_session = requests.Session()
@@ -1403,7 +1412,7 @@ def is_group_admin(message):
         if message.chat.type in ["group","supergroup"]:
             user_id = message.from_user.id
             member = bot.get_chat_member(message.chat.id, user_id)
-            return member.status in ["creator", "administrator"]
+            return member.status in ADMIN_MEMBER_STATUSES
         return False
     except Exception as e:
         logging.error(f"Error checking admin status: {e}")
@@ -3916,7 +3925,7 @@ def add_wallet_command(message):
             wallet_address = command_parts[2].strip()
             try:
                 target_member = bot.get_chat_member(message.chat.id, target_user_id)
-                if target_member.status not in ["creator", "administrator", "member", "restricted"]:
+                if target_member.status not in ACTIVE_GROUP_MEMBER_STATUSES:
                     bot.reply_to(message, "❌ That user is not currently a member of this group.")
                     return
                 target_user = target_member.user
@@ -3926,10 +3935,7 @@ def add_wallet_command(message):
                 return
 
         chat_id = message.chat.id
-        full_name = " ".join(
-            part for part in [target_user.first_name, getattr(target_user, "last_name", None)] if part
-        ).strip()
-        target_user_name = target_user.username or full_name or f"User{target_user.id}"
+        target_user_name = get_telegram_user_display_name(target_user)
 
         if not is_valid_wallet_address(wallet_address):
             bot.reply_to(message, f"❌ Invalid wallet address format: '{wallet_address}'. Please check and try again.")
